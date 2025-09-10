@@ -755,8 +755,8 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
       if (v > DBL_MAX) {
 	std::cerr
-	  << "numbers overflowed to infinity in Baum-Welch: quitting\n";
-	exit(1);
+	  << "numbers overflowed to infinity in Baum-Welch...\n";
+	break;
       }
 
       /* Backward pass, calculate Wbar, Ybar, Zbar. */
@@ -784,11 +784,6 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
               << (termCond ? "    converged" : "not converged");
 
   } while (!termCond && num_iterations < maxIter);
-
-  std::cerr << "\nError tolerance: " << bwMaxDiff
-            << ", iterations: " << num_iterations << ", "
-            << (termCond ? "Baum-Welch converged" : "Baum-Welch not converged")
-            << "\n";
 
 }
 
@@ -849,7 +844,7 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
 
     if (!countOnly) {
       baumWelch(counts, ma, alphabetSize, dmix, gp,
-          profileLength, weights.data(), bwMaxiter, bwMaxDiff);
+        profileLength, weights.data(), bwMaxiter, bwMaxDiff);
     }
 
     std::vector<double> probs(counts.size() + alphabetSize);
@@ -857,20 +852,14 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
     countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
         counts.data(), probs.data());
 
-    // TODO instead of probs like this, take mean for each transition type among all positions
-    // the emissions can be deleted
-
-    std::vector<double> mean_transitions(7, 0.0);
-
-    for (int t = 0; t < 7; ++t) {
-      double sum = 0.0;
-      for (int i = 0; i <= profileLength; i++) {
-        sum += probs[i * width + t];
+    for (int i = 0; i <= profileLength; i++) {
+      std::vector<double> transitions_i(7, 0.0);
+      for (int t = 0; t < 7; t++) {
+        transitions_i[t] = probs[i * width + t];
       }
-      mean_transitions[t] = sum / (profileLength+1);
+      all_probs.push_back(std::move(transitions_i));
     }
 
-    all_probs.push_back(std::move(mean_transitions));
   }
 
   return all_probs;
@@ -935,14 +924,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Number of alignments processed: " << all_probs.size() << "\n";
     for (size_t i = 0; i < all_probs.size(); ++i) {
-        std::cout << "Alignment " << i+1 << " probs size: " << all_probs[i].size() << "\n";
-        if (!all_probs[i].empty()) {
-            std::cout << "First 7 probs: ";
-            for (size_t j = 0; j < std::min<size_t>(7, all_probs[i].size()); ++j) {
-                std::cout << all_probs[i][j] << " ";
-            }
-            std::cout << "\n";
-        }
+      std::cout << "Alignment " << i+1 << " mean transitions: ";
+      for (size_t j = 0; j < all_probs[i].size(); ++j) {
+        std::cout << all_probs[i][j] << " ";
+      }
+      std::cout << "\n";
     }
     return 0;
 }

@@ -42,7 +42,7 @@ gp = GapPriors(
 )
 
 res = lib.build_hmm_c(
-    b"fn3.sto",
+    b"alignments/fn3.sto",
     0.5,           # symfrac
     0.59, 45.0,    # ere, esigma
     1000.0, 1e-6,  # bwMaxiter, bwMaxDiff
