@@ -69,7 +69,7 @@ def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[lis
             msa.encode('utf-8'),
             0.5,           # symfrac
             0.59, 45.0,    # ere, esigma
-            10.0, 1e-6,  # bwMaxiter, bwMaxDiff
+            50.0, 1e-6,  # bwMaxiter, bwMaxDiff
             True,         # countOnly -> true for testing!
             priors
         )
@@ -87,13 +87,16 @@ def normalize_frequencies(freqs: np.ndarray) -> np.ndarray:
     return freqs
 
 def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
+    probs = probs + 1
     a_d_g = np.array([prob[0:3] for prob in probs])
     b_bp  = np.array([prob[3:5] for prob in probs])
     e_ep  = np.array([prob[5:7] for prob in probs])
     
-    a_d_g = normalize_frequencies(a_d_g)
-    b_bp  = normalize_frequencies(b_bp)
-    e_ep  = normalize_frequencies(e_ep)
+    #a_d_g = normalize_frequencies(a_d_g)
+    #b_bp  = normalize_frequencies(b_bp)
+    #e_ep  = normalize_frequencies(e_ep)
+    
+    print(np.array2string(a_d_g[:100], formatter={'float_kind':lambda x: f"{x:0.4f}"}))
     
     a = dirichlet.mle(a_d_g)
     b = dirichlet.mle(b_bp)
@@ -127,6 +130,7 @@ if __name__ == "__main__":
     for iteration in range(max_iterations):
         
         probs = get_transition_probabilities(msas, gp)
+        
         new_gp = get_new_gap_priors(probs)
         
         max_diff = get_max_diff(gp, new_gp)

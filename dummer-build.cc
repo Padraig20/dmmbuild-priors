@@ -198,9 +198,10 @@ void setBackgroundProbs(double *bgProbs, const double *probs,
 
 double getProb(double count1, double count2,
 	       double pseudocount1, double pseudocount2, double maxCountSum) {
-  double s = count1 + count2;
-  double r = (s > maxCountSum) ? maxCountSum / s : 1.0;
-  return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
+  //double s = count1 + count2;
+  //double r = (s > maxCountSum) ? maxCountSum / s : 1.0;
+  //return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
+  return (count1 + count2) == 0.0 ? 0.0 : count1 / (count1 + count2);
 }
 
 void applyDirichletMixture(DirichletMixture dmix,
@@ -232,6 +233,32 @@ void applyDirichletMixture(DirichletMixture dmix,
   }
 
   normalize(probEstimate, alphabetSize);
+}
+
+void countsToParamCounts(const double* counts, double* paramCounts,
+       int alphabetSize) {
+  int countsPerPosition = 7 + alphabetSize;
+  int profileLength = 0;
+  while (counts[(profileLength + 1) * countsPerPosition] != 0) {
+    ++profileLength;
+  }
+
+  for (int i = 0; i <= profileLength; ++i) {
+    const double *c = counts + i * countsPerPosition;
+    double *p = paramCounts + i * countsPerPosition;
+
+    // copy letter counts
+    std::copy(c + 7, c + 7 + alphabetSize, p + 7);
+
+    // copy gap counts
+    p[0] = c[1]; // gamma
+    p[1] = c[2]; // delta
+    p[2] = c[3]; // alpha
+    p[3] = c[3]; // betap
+    p[4] = c[4]; // beta
+    p[5] = c[5]; // epsilonp
+    p[6] = c[6]; // epsilon
+  }
 }
 
 void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
@@ -754,8 +781,8 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
         profileLength, width, &v, X, Y, Z);
 
       if (v > DBL_MAX) {
-	std::cerr
-	  << "numbers overflowed to infinity in Baum-Welch...\n";
+	//std::cerr
+	//  << "numbers overflowed to infinity in Baum-Welch...\n";
 	break;
       }
 
@@ -780,8 +807,9 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
     std::copy(probsNew.begin(), probsNew.end(), probsOld.begin());
 
-    std::cerr << "\rIteration " << ++num_iterations << " / " << maxIter << ": "
-              << (termCond ? "    converged" : "not converged");
+    //std::cerr << "\rIteration " << ++num_iterations << " / " << maxIter << ": "
+    //          << (termCond ? "    converged" : "not converged");
+    num_iterations++;
 
   } while (!termCond && num_iterations < maxIter);
 
@@ -809,9 +837,14 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
 
   std::cout << std::fixed;
 
-  std::vector<std::vector<double>> all_probs;
+  std::vector<std::vector<double>> all_counts;
+
+  int count = 0;
 
   while (readMultipleAlignment(in, ma)) {
+    if (count ++ == 300) {
+      break;
+    }
     bool isProtein = isProteinAlignment(ma);
     const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
     int alphabetSize = strlen(alphabet);
@@ -847,22 +880,21 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
         profileLength, weights.data(), bwMaxiter, bwMaxDiff);
     }
 
-    std::vector<double> probs(counts.size() + alphabetSize);
+    std::vector<double> paramCounts(counts.size() + alphabetSize);
 
-    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-        counts.data(), probs.data());
+    countsToParamCounts(counts.data(), paramCounts.data(), alphabetSize);
 
     for (int i = 0; i <= profileLength; i++) {
       std::vector<double> transitions_i(7, 0.0);
       for (int t = 0; t < 7; t++) {
-        transitions_i[t] = probs[i * width + t];
+        transitions_i[t] = paramCounts[i * width + t];
       }
-      all_probs.push_back(std::move(transitions_i));
+      all_counts.push_back(std::move(transitions_i));
     }
 
   }
 
-  return all_probs;
+  return all_counts;
 }
 
 /* C-Types Wrapper */
