@@ -1,10 +1,9 @@
 import os
-import sys
 import ctypes
 import dirichlet
 import numpy as np
 
-eps = sys.float_info.epsilon
+eps = 1e-10
 
 # Setting up C-Types for calling the dummer-build shared library
 lib = ctypes.CDLL(os.path.abspath("dummer-build.so"))
@@ -67,10 +66,10 @@ def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[lis
     for msa in msas:
         res = lib.build_hmm_c(
             msa.encode('utf-8'),
-            0.5,           # symfrac
-            0.59, 45.0,    # ere, esigma
-            50.0, 1e-6,  # bwMaxiter, bwMaxDiff
-            True,         # countOnly -> true for testing!
+            0.50,          # symfrac
+            0.59, 45.0,    # ere (protein), esigma
+            100.0, 1e-6,   # bwMaxiter, bwMaxDiff
+            False,         # countOnly -> true for testing!
             priors
         )
         for i in range(int(res.len/7)):
@@ -80,32 +79,29 @@ def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[lis
             results.append(probs)
     return results
 
-# safeguard against zeros and ones
-def normalize_frequencies(freqs: np.ndarray) -> np.ndarray:
-    freqs = np.clip(freqs, eps, 1 - eps)
-    freqs /= freqs.sum(axis=1, keepdims=True)
-    return freqs
-
 def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
-    probs = probs + 1
+
+    probs = np.array(probs) + eps # avoid zeros for dirichlet MLE
+
     a_d_g = np.array([prob[0:3] for prob in probs])
     b_bp  = np.array([prob[3:5] for prob in probs])
     e_ep  = np.array([prob[5:7] for prob in probs])
     
-    #a_d_g = normalize_frequencies(a_d_g)
-    #b_bp  = normalize_frequencies(b_bp)
-    #e_ep  = normalize_frequencies(e_ep)
-    
-    print(np.array2string(a_d_g[:100], formatter={'float_kind':lambda x: f"{x:0.4f}"}))
-    
-    a = dirichlet.mle(a_d_g)
-    b = dirichlet.mle(b_bp)
-    e = dirichlet.mle(e_ep)
+    try:
+        a = dirichlet.mle(a_d_g)
+        b = dirichlet.mle(b_bp)
+        e = dirichlet.mle(e_ep)
+    except Exception as ex:
+        print("-"*100)
+        print(f"Exception during Dirichlet MLE: {ex}")
+        print(f"Most likely we're simply done: Returning previous gap priors...")
+        print("-"*100)
+        return gp
     
     return GapPriors(
-        match= a[0], insStart= a[1], delStart= a[2],
-        insEnd= b[0], insExtend= b[1],
-        delEnd= e[0], delExtend= e[1]
+        match=a[0], insStart=a[1], delStart=a[2],
+        insEnd=b[0], insExtend=b[1],
+        delEnd=e[0], delExtend=e[1]
     )
     
 def get_max_diff(gp1: GapPriors, gp2: GapPriors) -> float:
@@ -120,38 +116,7 @@ def get_max_diff(gp1: GapPriors, gp2: GapPriors) -> float:
     ]
     return max(diffs)
 
-if __name__ == "__main__":
-    msas = get_msa_filenames("alignments")
-    print(f"Found {len(msas)} MSA files: {msas}")
-    
-    max_iterations = 10
-    tolerance = 1e-3
-    
-    for iteration in range(max_iterations):
-        
-        probs = get_transition_probabilities(msas, gp)
-        
-        new_gp = get_new_gap_priors(probs)
-        
-        max_diff = get_max_diff(gp, new_gp)
-        
-        gp = new_gp
-        
-        print(f"Iteration {iteration+1}:")
-        print(f" match:     {gp.match:.6f}")
-        print(f" insStart:  {gp.insStart:.6f}")
-        print(f" delStart:  {gp.delStart:.6f}")
-        print(f" insEnd:    {gp.insEnd:.6f}")
-        print(f" insExtend: {gp.insExtend:.6f}")
-        print(f" delEnd:    {gp.delEnd:.6f}")
-        print(f" delExtend: {gp.delExtend:.6f}")
-        print(f" max_diff:  {max_diff:.6e}")
-        
-        if max_diff < tolerance:
-            print("Converged.")
-            break
-    
-    print(f"Final gap priors after {iteration+1} iterations:")
+def print_gap_priors(gp: GapPriors):
     print(f" match:     {gp.match:.6f}")
     print(f" insStart:  {gp.insStart:.6f}")
     print(f" delStart:  {gp.delStart:.6f}")
@@ -159,3 +124,31 @@ if __name__ == "__main__":
     print(f" insExtend: {gp.insExtend:.6f}")
     print(f" delEnd:    {gp.delEnd:.6f}")
     print(f" delExtend: {gp.delExtend:.6f}")
+
+if __name__ == "__main__":
+    msas = get_msa_filenames("alignments")
+    print(f"Found {len(msas)} MSA files: {msas}")
+    
+    max_iterations = 100
+    
+    for iteration in range(max_iterations):
+        
+        probs = get_transition_probabilities(msas, gp)
+        new_gp = get_new_gap_priors(probs)
+        
+        max_diff = get_max_diff(gp, new_gp)
+        
+        gp = new_gp
+        
+        print(f"Iteration {iteration+1}:")
+        print_gap_priors(gp)
+        
+        if max_diff < eps:
+            print("Converged.")
+            break
+    
+    print()
+    print("="*100)
+    print()
+    print(f"Final gap priors after {iteration+1} iterations:")
+    print_gap_priors(gp)

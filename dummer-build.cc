@@ -198,10 +198,9 @@ void setBackgroundProbs(double *bgProbs, const double *probs,
 
 double getProb(double count1, double count2,
 	       double pseudocount1, double pseudocount2, double maxCountSum) {
-  //double s = count1 + count2;
-  //double r = (s > maxCountSum) ? maxCountSum / s : 1.0;
-  //return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
-  return (count1 + count2) == 0.0 ? 0.0 : count1 / (count1 + count2);
+  double s = count1 + count2;
+  double r = (s > maxCountSum) ? maxCountSum / s : 1.0;
+  return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
 }
 
 void applyDirichletMixture(DirichletMixture dmix,
@@ -236,14 +235,10 @@ void applyDirichletMixture(DirichletMixture dmix,
 }
 
 void countsToParamCounts(const double* counts, double* paramCounts,
-       int alphabetSize) {
+       int alphabetSize, int profileLength) {
   int countsPerPosition = 7 + alphabetSize;
-  int profileLength = 0;
-  while (counts[(profileLength + 1) * countsPerPosition] != 0) {
-    ++profileLength;
-  }
 
-  for (int i = 0; i <= profileLength; ++i) {
+  for (int i = 0; i <= profileLength; i++) {
     const double *c = counts + i * countsPerPosition;
     double *p = paramCounts + i * countsPerPosition;
 
@@ -727,6 +722,7 @@ int determineTerminationCondition(double bwMaxDiff,
   for (size_t i = 0; i < probsOld.size(); i++) {
     double diff = fabs(probsOld[i] - probsNew[i]);
     if (diff > maxDiff) maxDiff = diff;
+    if (std::isnan(probsNew[i])) return -1; // overflow
   }
   return (maxDiff <= bwMaxDiff) ? 1 : 0; // converged or not
 }
@@ -780,11 +776,8 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
       forward(seqNoGap, seqLength, probsOld,
         profileLength, width, &v, X, Y, Z);
 
-      if (v > DBL_MAX) {
-	//std::cerr
-	//  << "numbers overflowed to infinity in Baum-Welch...\n";
-	break;
-      }
+      // numbers overflowed to infinity
+      if (v > DBL_MAX || std::isnan(v)) break;
 
       /* Backward pass, calculate Wbar, Ybar, Zbar. */
       backward(seqNoGap, seqLength, probsOld,
@@ -805,10 +798,10 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
        Then overwrite the old probabilities with the new ones. */
     termCond = determineTerminationCondition(bwMaxDiff, probsOld, probsNew);
 
+    if (termCond == -1) break; // overflow, keep old probs
+
     std::copy(probsNew.begin(), probsNew.end(), probsOld.begin());
 
-    //std::cerr << "\rIteration " << ++num_iterations << " / " << maxIter << ": "
-    //          << (termCond ? "    converged" : "not converged");
     num_iterations++;
 
   } while (!termCond && num_iterations < maxIter);
@@ -839,12 +832,7 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
 
   std::vector<std::vector<double>> all_counts;
 
-  int count = 0;
-
   while (readMultipleAlignment(in, ma)) {
-    if (count ++ == 300) {
-      break;
-    }
     bool isProtein = isProteinAlignment(ma);
     const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
     int alphabetSize = strlen(alphabet);
@@ -880,15 +868,15 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
         profileLength, weights.data(), bwMaxiter, bwMaxDiff);
     }
 
+    /* As output, we will have the transition counts only. */
     std::vector<double> paramCounts(counts.size() + alphabetSize);
-
-    countsToParamCounts(counts.data(), paramCounts.data(), alphabetSize);
+    countsToParamCounts(counts.data(), paramCounts.data(),
+      alphabetSize, profileLength);
 
     for (int i = 0; i <= profileLength; i++) {
       std::vector<double> transitions_i(7, 0.0);
-      for (int t = 0; t < 7; t++) {
+      for (int t = 0; t < 7; t++)
         transitions_i[t] = paramCounts[i * width + t];
-      }
       all_counts.push_back(std::move(transitions_i));
     }
 
@@ -937,6 +925,7 @@ ArrayDouble build_hmm_c(const char* filename,
 
 }
 
+// This really only exists for testing purposes...
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <alignment_file>\n";
@@ -944,9 +933,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Use default parameters for testing
-    double symfrac = OPT_symfrac;
-    double ere = OPT_ere_aa;
-    double esigma = OPT_esigma;
+    double symfrac   = OPT_symfrac;
+    double ere       = OPT_ere_aa;
+    double esigma    = OPT_esigma;
     double bwMaxiter = OPT_bw_maxiter;
     double bwMaxDiff = OPT_bw_maxDiff;
     bool countOnly = false;
