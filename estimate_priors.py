@@ -68,7 +68,7 @@ def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[lis
             msa.encode('utf-8'),
             0.50,          # symfrac
             0.59, 45.0,    # ere (protein), esigma
-            100.0, 1e-6,   # bwMaxiter, bwMaxDiff
+            1.0, 1e-6,     # bwMaxiter, bwMaxDiff
             False,         # countOnly -> true for testing!
             priors
         )
@@ -79,13 +79,29 @@ def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[lis
             results.append(probs)
     return results
 
+def additive_smoothing(probs: list[list[float]]) -> list[list[float]]:
+    smoothed = []
+    for prob in probs:
+        prob = np.array(prob) + eps
+        prob = prob / prob.sum()
+        smoothed.append(prob.tolist())
+    return np.array(smoothed)
+
 def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
 
-    probs = np.array(probs) + eps # avoid zeros for dirichlet MLE
+    #probs = np.array(probs) + eps # avoid zeros for dirichlet MLE
 
     a_d_g = np.array([prob[0:3] for prob in probs])
     b_bp  = np.array([prob[3:5] for prob in probs])
     e_ep  = np.array([prob[5:7] for prob in probs])
+
+    a_d_g = additive_smoothing(a_d_g)
+    b_bp  = additive_smoothing(b_bp)
+    e_ep  = additive_smoothing(e_ep)
+
+    a_d_g = a_d_g / a_d_g.sum(axis=1, keepdims=True)
+    b_bp  = b_bp  / b_bp.sum(axis=1, keepdims=True)
+    e_ep  = e_ep  / e_ep.sum(axis=1, keepdims=True)
     
     try:
         a = dirichlet.mle(a_d_g)

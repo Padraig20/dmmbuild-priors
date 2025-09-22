@@ -31,6 +31,10 @@
 #define OPT_bw_maxiter 1000
 #define OPT_bw_maxDiff 1e-6
 
+// down-scale probabilities by this amount, to delay overflow:
+const double scale1 = 1.0 / (1<<30) / (1<<30) / (1<<30) / (1<<30);
+const double scale = scale1 * scale1 * scale1 * scale1;
+
 // From "Dirichlet mixtures: a method for improved detection of weak
 // but significant protein sequence homology"
 // K Sjolander, K Karplus, M Brown, R Hughey, A Krogh, IS Mian, D Haussler
@@ -210,6 +214,7 @@ void applyDirichletMixture(DirichletMixture dmix,
   double countSum = std::accumulate(counts, counts + alphabetSize, 0.0);
   double rescale = (countSum > maxCountSum) ? maxCountSum / countSum : 1.0;
   std::vector<double> logs(dmix.componentCount);
+  std::fill_n(probEstimate, alphabetSize, 0.0);
 
   for (int i = 0; i < dmix.componentCount; ++i) {
     const double *alphas = dmix.params + i * componentSize + 1;
@@ -583,7 +588,7 @@ void forward(
       if (!std::isfinite(S)) S = 0.0; // if letter has 0 background probability
 
       double y = Y[(i-1) * cols + j];
-      double w = X[(i-1) * cols + (j-1)] + y + z + 1.0;
+      double w = X[(i-1) * cols + (j-1)] + y + z + scale;
       z = aPrime * w + bPrime * z;
       *wSum += w;
 
@@ -637,7 +642,7 @@ void backward(unsigned char *seq, int seqLength,
 
       double x = S * Wbar[(i+1) * cols + (j+1)];
       double y = Ybar[(i+1) * cols + j];
-      double w = x + dPrime * y + aPrime * z + 1.0;
+      double w = x + dPrime * y + aPrime * z + scale;
       z = w + bPrime * z;
 
       Wbar[i * cols + j] = w;
@@ -692,13 +697,13 @@ void calculateTransitionCounts(
     gamma = std::accumulate(emis, emis + alphabetSize + 1, 0.0);
 
     // update the HMM parameters
-    counts[(i-1) * width + 0] += etap     * wt;
-    counts[(i-1) * width + 1] += gamma    * wt;
+    counts[(i-1) * width + 0] += etap * scale * wt;
+    counts[(i-1) * width + 1] += gamma        * wt;
 
-    counts[(i-1) * width + 3] += alpha    * wt;
-    counts[(i-1) * width + 4] += beta     * wt;
-    counts[(i-1) * width + 5] += epsilonp * wt;
-    counts[(i-1) * width + 6] += epsilon  * wt;
+    counts[(i-1) * width + 3] += alpha        * wt;
+    counts[(i-1) * width + 4] += beta         * wt;
+    counts[(i-1) * width + 5] += epsilonp     * wt;
+    counts[(i-1) * width + 6] += epsilon      * wt;
 
     // emission probabilities
     if (i == profileLength+1) continue; // no emissions from the end state
@@ -768,7 +773,6 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
     for (int idx = 0; idx < ma.sequenceCount; idx++) {
       int seqLength = seqsLengths[idx];
-      double wt = weights[idx]; // weight for the current sequence
 
       /* Forward pass, calculate X, Y, Z and
          the aggregated v (i.e. sum of w-values). */
@@ -783,9 +787,11 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
       backward(seqNoGap, seqLength, probsOld,
         profileLength, width, Wbar, Ybar, Zbar);
 
+      double wt = weights[idx] / (v * scale);
+
       /* Calculate and update parameters in new parameter counts. */
       calculateTransitionCounts(counts, profileLength, seqLength,
-          Wbar, Ybar, Zbar, X, Y, Z, wt/v, width, alphabetSize, seqNoGap);
+          Wbar, Ybar, Zbar, X, Y, Z, wt, width, alphabetSize, seqNoGap);
 
       seqNoGap += seqLength;
     }
@@ -885,6 +891,84 @@ std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
   return all_counts;
 }
 
+double relativeEntropy(const double *probs,
+		       int alphabetSize, int profileLength) {
+  int probsPerPosition = 7 + alphabetSize;
+  const double *bgProbs = probs + profileLength * probsPerPosition;
+
+  double r = 0;
+  for (int i = 0; i < profileLength; ++i) {
+    for (int j = 0; j < alphabetSize; ++j) {
+      r += probs[j] * log2(probs[j] / bgProbs[j]);
+    }
+    probs += probsPerPosition;
+  }
+  return r;
+}
+
+std::vector<double> get_relative_entropies(const char* filename, double symfrac,
+          double ere,
+          double bwMaxiter, double bwMaxDiff,
+          bool countOnly, GapPriors gp) {
+
+  std::ifstream file;
+  std::istream &in = openFile(file, filename);
+  if (!file) exit(1);
+
+  unsigned char charToNumber[256];
+  MultipleAlignment ma;
+
+  std::cout << std::fixed;
+
+  std::vector<double> all_entropies;
+
+  while (readMultipleAlignment(in, ma)) {
+    bool isProtein = isProteinAlignment(ma);
+    const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
+    int alphabetSize = strlen(alphabet);
+    memset(charToNumber, alphabetSize, 256);
+    setCharToNumber(charToNumber, alphabet);
+    if (!isProtein) setCharToNumber(charToNumber, "ACGU");
+    charToNumber['-'] = charToNumber['.']
+      = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
+
+    DirichletMixture dmix;
+    dmix.params = isProtein ? blocks9 : wheeler4;
+    dmix.componentCount = (isProtein ? sizeof blocks9 : sizeof wheeler4)
+      / sizeof(double) / (1 + alphabetSize);
+
+    for (auto &i : ma.alignment) i = charToNumber[i];
+
+    markEndGaps(ma, alphabetSize);
+
+    std::vector<double> weights(ma.sequenceCount);
+    makeSequenceWeights(ma, alphabetSize, symfrac, weights.data());
+    double weightSum = std::accumulate(weights.begin(), weights.end(), 0.0);
+
+    std::vector<double> counts;
+    std::vector<int> columns;
+    countEvents(ma, alphabetSize, symfrac, weights.data(), weightSum,
+        counts, columns);
+    int profileLength = columns.size();
+
+    if (!countOnly) {
+      baumWelch(counts, ma, alphabetSize, dmix, gp,
+        profileLength, weights.data(), bwMaxiter, bwMaxDiff);
+    }
+
+    std::vector<double> probs(counts.size() + alphabetSize);
+    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+        counts.data(), probs.data());
+
+    /* As output, we will now have the relative entropies only (one per MSA). */
+    double re = relativeEntropy(probs.data() + 7, alphabetSize, profileLength);
+
+    all_entropies.push_back(re);
+  }
+
+  return all_entropies;
+}
+
 /* C-Types Wrapper */
 
 extern "C" {
@@ -923,7 +1007,29 @@ ArrayDouble build_hmm_c(const char* filename,
     return arr;
 }
 
+ArrayDouble get_relative_entropies_c(const char* filename,
+                      double symfrac,
+                      double ere,
+                      double bwMaxiter, double bwMaxDiff,
+                      bool countOnly,
+                      GapPriors gp)
+{
+    std::vector<double> entropies =
+        get_relative_entropies(filename, symfrac, ere,
+                  bwMaxiter, bwMaxDiff, countOnly, gp);
+    
+    size_t total_size = entropies.size();
+    double* res = static_cast<double*>(std::malloc(total_size * sizeof(double)));
+    std::copy(entropies.begin(), entropies.end(), res);
+
+    ArrayDouble arr;
+    arr.data = res;
+    arr.size = total_size;
+    return arr;
+
 }
+
+} // extern "C"
 
 // This really only exists for testing purposes...
 int main(int argc, char* argv[]) {
