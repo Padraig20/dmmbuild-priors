@@ -1,3 +1,9 @@
+# Estimating Priors for DUMMER-build
+
+This repository takes (almost all) code from 
+[DUMMER](https://gitlab.com/mcfrith/seq-position-probs),
+for which we try to estimate good pseudocounts. See below...
+
 # DUMMER
 
 DUMMER (Dumb Uncomplicated Match ModelER) aims to find distant
