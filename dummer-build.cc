@@ -2,8 +2,11 @@
 //         Patrick Styll   2025
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include <fstream>
-#include <iostream>
+#include "dummer-util.hh"
+
+#include "priors/blocks9.hh"
+#include "priors/wheeler4.hh"
+#include "priors/gap-priors.hh"
 
 #include <algorithm>
 #include <iomanip>
@@ -35,118 +38,7 @@
 const double scale1 = 1.0 / (1<<30) / (1<<30) / (1<<30) / (1<<30);
 const double scale = scale1 * scale1 * scale1 * scale1;
 
-// From "Dirichlet mixtures: a method for improved detection of weak
-// but significant protein sequence homology"
-// K Sjolander, K Karplus, M Brown, R Hughey, A Krogh, IS Mian, D Haussler
-
-// There are 2 versions of this paper floating about the internet,
-// with slightly different mixture coefficients!
-
-// This is the version used by HMMER 3.4, and it's different from the
-// version at the journal website.
-
-const double blocks9[] = {
-  0.178091,
-  0.270671, 0.039848, 0.017576, 0.016415, 0.014268, 0.131916, 0.012391,
-  0.022599, 0.020358, 0.030727, 0.015315, 0.048298, 0.053803, 0.020662,
-  0.023612, 0.216147, 0.147226, 0.065438, 0.003758, 0.009621,
-
-  0.056591,
-  0.021465, 0.010300, 0.011741, 0.010883, 0.385651, 0.016416, 0.076196,
-  0.035329, 0.013921, 0.093517, 0.022034, 0.028593, 0.013086, 0.023011,
-  0.018866, 0.029156, 0.018153, 0.036100, 0.071770, 0.419641,
-
-  0.0960191,
-  0.561459, 0.045448, 0.438366, 0.764167, 0.087364, 0.259114, 0.214940,
-  0.145928, 0.762204, 0.247320, 0.118662, 0.441564, 0.174822, 0.530840,
-  0.465529, 0.583402, 0.445586, 0.227050, 0.029510, 0.121090,
-
-  0.0781233,
-  0.070143, 0.011140, 0.019479, 0.094657, 0.013162, 0.048038, 0.077000,
-  0.032939, 0.576639, 0.072293, 0.028240, 0.080372, 0.037661, 0.185037,
-  0.506783, 0.073732, 0.071587, 0.042532, 0.011254, 0.028723,
-
-  0.0834977,
-  0.041103, 0.014794, 0.005610, 0.010216, 0.153602, 0.007797, 0.007175,
-  0.299635, 0.010849, 0.999446, 0.210189, 0.006127, 0.013021, 0.019798,
-  0.014509, 0.012049, 0.035799, 0.180085, 0.012744, 0.026466,
-
-  0.0904123,
-  0.115607, 0.037381, 0.012414, 0.018179, 0.051778, 0.017255, 0.004911,
-  0.796882, 0.017074, 0.285858, 0.075811, 0.014548, 0.015092, 0.011382,
-  0.012696, 0.027535, 0.088333, 0.944340, 0.004373, 0.016741,
-
-  0.114468,
-  0.093461, 0.004737, 0.387252, 0.347841, 0.010822, 0.105877, 0.049776,
-  0.014963, 0.094276, 0.027761, 0.010040, 0.187869, 0.050018, 0.110039,
-  0.038668, 0.119471, 0.065802, 0.025430, 0.003215, 0.018742,
-
-  0.0682132,
-  0.452171, 0.114613, 0.062460, 0.115702, 0.284246, 0.140204, 0.100358,
-  0.550230, 0.143995, 0.700649, 0.276580, 0.118569, 0.097470, 0.126673,
-  0.143634, 0.278983, 0.358482, 0.661750, 0.061533, 0.199373,
-
-  0.234585,
-  0.005193, 0.004039, 0.006722, 0.006121, 0.003468, 0.016931, 0.003647,
-  0.002184, 0.005019, 0.005990, 0.001473, 0.004158, 0.009055, 0.003630,
-  0.006583, 0.003172, 0.003690, 0.002967, 0.002772, 0.002686,
-};
-
-// This Dirichlet mixture & description were copied from HMMER 3.4
-// It doesn't satisfy Chargaff parity (A=T, C=G): undesirable for DNA?
-
-// Match emission priors are trained on Rmark3 database
-// Xref: ~wheelert/notebook/2011/0325_nhmmer_new_parameters
-
-const double wheeler4[] = {
-  0.24,
-  0.16,  0.45,  0.12,   0.39,
-
-  0.26,
-  0.09,  0.03,  0.09,   0.04,
-
-  0.08,
-  1.29,  0.40,  6.58,   0.51,
-
-  0.42,
-  1.74,  1.49,  1.57,   1.95,
-};
-
-/* ----------from utils---------- */
-
-bool isDash(const char *text) {
-  return text[0] == '-' && text[1] == 0;
-}
-
-std::istream &fail(std::istream &s, const char *message) {
-  std::cerr << message << "\n";
-  s.setstate(std::ios::failbit);
-  return s;
-}
-
-std::istream &openFile(std::ifstream &file, const char *name) {
-  if (isDash(name)) return std::cin;
-  file.open(name);
-  if (!file) std::cerr << "can't open file: " << name << "\n";
-  return file;
-}
-
-int badOpt() {
-  std::cerr << "bad option value\n";
-  return 1;
-}
-
-/* ------------------------------ */
-
-/* ----------from priors--------- */
-
-struct GapPriors {
-  double match, insStart, delStart;
-  double insEnd, insExtend;
-  double delEnd, delExtend;
-};
-
-/* ------------------------------ */
+int verbosity = 0;
 
 struct DirichletMixture {
   const double *params;
@@ -173,9 +65,17 @@ void normalize(double *x, int n) {
   for (int i = 0; i < n; ++i) x[i] /= s;
 }
 
+// some MSAs (if --pnone is used) may have zero probabilities
+// log(0)/log(NaN) would produce errors
 double geometricMean(const double *values, int length, int step) {
-  double s = 0;
-  for (int i = 0; i < length; ++i) s += log(values[i * step]);
+  const double minProb = 1e-6;
+  double s = 0.0;
+  for (int i = 0; i < length; ++i) {
+    double v = values[i * step];
+    assert(isfinite(v));
+    v = std::max(v, minProb);
+    s += log(v);
+  }
   return exp(s / length);
 }
 
@@ -203,6 +103,8 @@ void setBackgroundProbs(double *bgProbs, const double *probs,
 double getProb(double count1, double count2,
 	       double pseudocount1, double pseudocount2, double maxCountSum) {
   double s = count1 + count2;
+  // avoid zero division when pnone removes priors
+  if (s + (pseudocount1 + pseudocount2) == 0.0) return 0.5;
   double r = (s > maxCountSum) ? maxCountSum / s : 1.0;
   return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
 }
@@ -217,6 +119,7 @@ void applyDirichletMixture(DirichletMixture dmix,
   std::fill_n(probEstimate, alphabetSize, 0.0);
 
   for (int i = 0; i < dmix.componentCount; ++i) {
+    if (dmix.componentCount == 1) break;  // allows for alpha values that = 0
     const double *alphas = dmix.params + i * componentSize + 1;
     double alphaSum = std::accumulate(alphas, alphas + alphabetSize, 0.0);
     logs[i] = lgamma(alphaSum) - lgamma(countSum * rescale + alphaSum + 1);
@@ -239,32 +142,11 @@ void applyDirichletMixture(DirichletMixture dmix,
   normalize(probEstimate, alphabetSize);
 }
 
-void countsToParamCounts(const double* counts, double* paramCounts,
-       int alphabetSize, int profileLength) {
-  int countsPerPosition = 7 + alphabetSize;
-
-  for (int i = 0; i <= profileLength; i++) {
-    const double *c = counts + i * countsPerPosition;
-    double *p = paramCounts + i * countsPerPosition;
-
-    // copy letter counts
-    std::copy(c + 7, c + 7 + alphabetSize, p + 7);
-
-    // copy gap counts
-    p[0] = c[1]; // gamma
-    p[1] = c[2]; // delta
-    p[2] = c[3]; // alpha
-    p[3] = c[3]; // betap
-    p[4] = c[4]; // beta
-    p[5] = c[5]; // epsilonp
-    p[6] = c[6]; // epsilon
-  }
-}
 
 void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
 		      const double *counts, double *probs) {
-  double alnBeg = counts[0]; // etap
-  double match  = counts[1]; //gamma
+  double match  = counts[0]; //gamma
+  double notIns = counts[1]; //gamma + delta + tau = etap + oldGamma + epsilonp
   double delBeg = counts[2]; //delta
   double insBeg = counts[3]; //alpha
   double insEnd = insBeg;    //betap
@@ -272,21 +154,17 @@ void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   double delEnd = counts[5]; //epsilonp
   double delExt = counts[6]; //epsilon
 
-  // The "- alnBeg" avoids the insertion start probability changing
-  // if the aligned sequences are reversed:
-  double notIns = match + delBeg - alnBeg;
-
   double gpNotIns = gp.match + gp.delStart;
+  assert(notIns > 0);
   double a = getProb(insBeg, notIns, gp.insStart, gpNotIns, maxCountSum);
+  double d = getProb(delBeg, match, gp.delStart, gp.match, maxCountSum);
   probs[1] = a;  // insertion start probability
+  probs[0] = (1 - a) * (1 - d);
+  probs[2] = (1 - a) * d;  // deletion start probability
 
   double b = getProb(insExt, insEnd, gp.insExtend, gp.insEnd, maxCountSum);
   probs[3] = 1 - b;
   probs[4] = b;  // insertion extend probability
-
-  double d = getProb(delBeg, match, gp.delStart, gp.match, maxCountSum);
-  probs[0] = (1 - a) * (1 - d);
-  probs[2] = (1 - a) * d;  // deletion start probability
 
   double e = getProb(delExt, delEnd, gp.delExtend, gp.delEnd, maxCountSum);
   probs[5] = 1 - e;
@@ -319,6 +197,49 @@ void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
   p[2] = 0;         // delStart
 
   setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
+}
+
+double relativeEntropy(const double *probs,
+		       int alphabetSize, int profileLength) {
+  int probsPerPosition = 7 + alphabetSize;
+  const double *bgProbs = probs + profileLength * probsPerPosition;
+
+  double r = 0;
+  for (int i = 0; i < profileLength; ++i) {
+    for (int j = 0; j < alphabetSize; ++j) {
+      if (probs[j] > 0) r += probs[j] * log2(probs[j] / bgProbs[j]);
+    }
+    probs += probsPerPosition;
+  }
+  return r;
+}
+
+std::istream &readGapPriors(std::istream &in, GapPriors &gp) {
+  in >> gp.match >> gp.insStart >> gp.delStart
+     >> gp.insEnd >> gp.insExtend >> gp.delEnd >> gp.delExtend;
+  if (!in) std::cerr << "can't read the gap pseudocounts\n";
+  return in;
+}
+
+std::istream &readDirichletMixture(std::istream &in, DirichletMixture &dmix,
+				   std::vector<double> &params) {
+  int alphabetSize = 0;
+  int componentCount = 0;
+  double d = 0;
+  in >> alphabetSize >> componentCount;
+  for (int i = 0; i < componentCount; ++i) {
+    in >> d;
+    params.push_back(d);
+    for (int j = 0; j < alphabetSize; ++j) {
+      in >> d;
+      params.push_back(d);
+    }
+  }
+  dmix.params = params.data();
+  dmix.componentCount = componentCount;
+  if (componentCount < 1) in.setstate(std::ios::failbit);
+  if (!in) std::cerr << "can't read the Dirichlet mixture file\n";
+  return in;
 }
 
 std::istream &checkAlignmentBlock(std::istream &in, MultipleAlignment &ma,
@@ -403,6 +324,9 @@ bool isProteinAlignment(const MultipleAlignment &ma) {
     dna += counts[x] + counts[y];
   }
 
+  if (verbosity) std::cerr << "Nucleotide-like letters: " << dna << "\n"
+			   << "Total letters: " << tot << "\n";
+
   return 1.0 * dna / tot < 0.9;  // xxx ???
 }
 
@@ -444,7 +368,7 @@ void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
       for (int j = 0; j < ma.sequenceCount; ++j) {
 	int x = seq[j * ma.alignmentLength];
 	if (x < alphabetSize) {
-	  weights[j] += 1.0 / (types * counts[x]);
+	  weights[j] += 1.0 * nonGapCount / (types * counts[x]);
 	  ++positionCounts[j];
 	}
       }
@@ -461,13 +385,14 @@ void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
   }
 }
 
+
 void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
-		 const double *weights, double weightSum,
+		 const double *weights, double weightSum, const GapPriors &gp,
 		 std::vector<double> &allCounts, std::vector<int> &columns) {
   const int midGap = alphabetSize + 1;
   const int endGap = alphabetSize + 2;
   std::vector<char> states(ma.sequenceCount);
-  double alnBeg = 0;
+  double notIns = 0;
   double insBeg = 0;
   double insExt = 0;
   double delEnd = 0;
@@ -488,7 +413,7 @@ void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
       for (int j = 0; j < ma.sequenceCount; ++j) {
 	int x = seq[j * ma.alignmentLength];
 	if (x <= alphabetSize) {  // an aligned letter in a "match" column
-	  if (states[j] ==  0 )	alnBeg += weights[j];
+	  if (states[j] <= 'd')	notIns += weights[j];
 	  if (states[j] == 'd') delEnd += weights[j];
 	  states[j] = 'm';
 	} else if (x == midGap) {  // a gap in a "match" column
@@ -498,20 +423,47 @@ void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
 	  states[j] = 'd';
 	}
       }
-      allCounts.push_back(alnBeg);
+
+      // Count adjacent inserts, or adjacent deletes, as extensions or restarts
+      double iFrac = 1;  // fraction of adjacent inserts that are extensions
+      double dFrac = 1;  // fraction of adjacent deletes that are extensions
+      double iExt, dExt, iBeg, iEnd, dBeg, dEnd, nIns, iFracOld, dFracOld;
+      do {
+	iExt = insExt * iFrac;
+	dExt = delExt * dFrac;
+	iBeg = insBeg + (insExt - iExt);
+	iEnd = iBeg;  // insert end count = insert begin count
+	dBeg = delBeg + (delExt - dExt);
+	dEnd = delEnd + (delExt - dExt);
+	nIns = notIns + (delExt - dExt);
+	// Estimate the insertion and deletion probabilities from the counts:
+	double gpNotIns = gp.match + gp.delStart;
+	double a = getProb(iBeg, nIns, gp.insStart, gpNotIns, 1e37);
+	double d = getProb(dBeg, nonGapCount, gp.delStart, gp.match, 1e37);
+	double b = getProb(iExt, iEnd, gp.insExtend, gp.insEnd, 1e37);
+	double e = getProb(dExt, dEnd, gp.delExtend, gp.delEnd, 1e37);
+	// Estimate the extension fractions from the probabilities:
+	iFracOld = iFrac;
+	dFracOld = dFrac;
+	if (insExt > 0) iFrac = b / (b + a * (1 - b));
+	if (delExt > 0) dFrac = e / (e + (1 - a) * d * (1 - e));
+      } while (fabs(iFrac - iFracOld) > 1e-6 || fabs(dFrac - dFracOld) > 1e-6);
+
       allCounts.push_back(nonGapCount);
-      allCounts.push_back(delBeg);
-      allCounts.push_back(insBeg);  // insEnd = insBeg
-      allCounts.push_back(insExt);
-      allCounts.push_back(delEnd);
-      allCounts.push_back(delExt);
+      allCounts.push_back(nIns);
+      allCounts.push_back(dBeg);
+      allCounts.push_back(iEnd);  // insert end count = insert begin count
+      allCounts.push_back(iExt);
+      allCounts.push_back(dEnd);
+      allCounts.push_back(dExt);
       allCounts.insert(allCounts.end(), counts, counts + alphabetSize);
-      alnBeg = insBeg = insExt = delEnd = 0;
+      insBeg = insExt = delEnd = 0;
+      notIns = nonGapCount;
     } else {  // this position is defined as "insertion"
       for (int j = 0; j < ma.sequenceCount; ++j) {
 	int x = seq[j * ma.alignmentLength];
 	if (x <= alphabetSize) {  // a non-gap symbol
-	  if (states[j] ==  0 ) alnBeg += weights[j];
+	  if (states[j] <= 'd') notIns += weights[j];
 	  if (states[j] == 'd') delEnd += weights[j];
 	  if (states[j] != 'i') insBeg += weights[j];
 	  // xxx assumes extension (not restart) of an insertion:
@@ -522,12 +474,14 @@ void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
     }
   }
 
-  allCounts.insert(allCounts.end(), 7, 0.0);  // final gap counts must all be 0
+  allCounts.push_back(0.0);
+  allCounts.push_back(notIns);
+  allCounts.insert(allCounts.end(), 5, 0.0);  // final gap counts must be 0
+  allCounts.insert(allCounts.end(), alphabetSize, 0.0);
 
-  // We'll estimate probabilities from these counts, but there are 2 problems:
-  // 1. Adjacent inserts (or deletes) are assumed to be extension, not restart.
-  // 2. The counts assume the alignment is exactly correct and certain.
-  // We will mitigate both problems by using a Baum-Welch algorithm.
+  // We'll estimate probabilities from these counts, but
+  // the counts assume the alignment is exactly correct and certain.
+  // We will mitigate that by using a Baum-Welch algorithm.
 }
 
 void getSequenceWithoutGaps(
@@ -572,7 +526,7 @@ void forward(
     // can use arbitrary values for S_m, d_m, e_m
     dPrime = deltaProb   * (1 - epsilonProb1);
     ePrime = epsilonProb * (1 - epsilonProb1) / (1 - epsilonProb);
-    if (!std::isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
+    if (!isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
 
     X[(i-1) * cols] = 0.0;
     double z = Z[i * cols] = 0.0;
@@ -585,7 +539,7 @@ void forward(
       double S = (1 - alphaProb - deltaProb)
                * probs[(i-1) * width + (7 + letter)]
                / probs[profileLength * width + (7 + letter)];
-      if (!std::isfinite(S)) S = 0.0; // if letter has 0 background probability
+      if (!isfinite(S)) S = 0.0; // if letter has 0 background probability
 
       double y = Y[(i-1) * cols + j];
       double w = X[(i-1) * cols + (j-1)] + y + z + scale;
@@ -625,7 +579,7 @@ void backward(unsigned char *seq, int seqLength,
     // can use arbitrary values for S_m, d_m, e_m
     dPrime = deltaProb   * (1 - epsilonProb1);
     ePrime = epsilonProb * (1 - epsilonProb1) / (1 - epsilonProb);
-    if (!std::isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
+    if (!isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
 
     Wbar[(i+2) * cols - 1] = 0.0;
     double z = Zbar[(i+1) * cols - 1] = 0.0;
@@ -638,7 +592,7 @@ void backward(unsigned char *seq, int seqLength,
       double S = (1 - alphaProb - deltaProb)
                * probs[i * width + (7 + letter)]
                / probs[profileLength * width + (7 + letter)];
-      if (!std::isfinite(S)) S = 0.0; // if letter has 0 background probability
+      if (!isfinite(S)) S = 0.0; // if letter has 0 background probability
 
       double x = S * Wbar[(i+1) * cols + (j+1)];
       double y = Ybar[(i+1) * cols + j];
@@ -662,6 +616,7 @@ void calculateTransitionCounts(
   int cols = seqLength + 2;
   double alpha, beta, delta, epsilon;
   double gamma, betap, epsilonp, etap;
+  double oldGamma = 0;
 
   // estimate counts for every position
   for (int i = 1; i <= profileLength+1; i++) {
@@ -684,26 +639,27 @@ void calculateTransitionCounts(
     }
 
     beta  -= betap;
-    if (beta < -__DBL_EPSILON__)
-      std::cerr << "Warning: Negative beta count at position " << i << "\n";
+    assert(beta >= 0);
 
     epsilon  -= epsilonp;
-    if (epsilon < -__DBL_EPSILON__)
-      std::cerr << "Warning: Negative epsilon count at position " << i << "\n";
+    assert(epsilon >= 0);
 
     // expected count of alpha
     alpha = betap;
 
     gamma = std::accumulate(emis, emis + alphabetSize + 1, 0.0);
 
-    // update the HMM parameters
-    counts[(i-1) * width + 0] += etap * scale * wt;
-    counts[(i-1) * width + 1] += gamma        * wt;
+    double notIns = etap * scale + oldGamma + epsilonp;
+    oldGamma = gamma;
 
-    counts[(i-1) * width + 3] += alpha        * wt;
-    counts[(i-1) * width + 4] += beta         * wt;
-    counts[(i-1) * width + 5] += epsilonp     * wt;
-    counts[(i-1) * width + 6] += epsilon      * wt;
+    // update the HMM parameters
+    counts[(i-1) * width + 0] += gamma    * wt;
+    counts[(i-1) * width + 1] += notIns   * wt;
+
+    counts[(i-1) * width + 3] += alpha    * wt;
+    counts[(i-1) * width + 4] += beta     * wt;
+    counts[(i-1) * width + 5] += epsilonp * wt;
+    counts[(i-1) * width + 6] += epsilon  * wt;
 
     // emission probabilities
     if (i == profileLength+1) continue; // no emissions from the end state
@@ -715,8 +671,7 @@ void calculateTransitionCounts(
   for (int i = 1; i <= profileLength; i++) {
     delta = counts[i * width + 5] + counts[i * width + 6]
       - counts[(i-1) * width + 6];
-    if (delta < -__DBL_EPSILON__)
-      std::cerr << "Warning: Negative delta count at position " << i << "\n";
+    delta = std::max(delta, 0.0);
     counts[(i-1) * width + 2] = delta;
   }
 }
@@ -727,20 +682,19 @@ int determineTerminationCondition(double bwMaxDiff,
   for (size_t i = 0; i < probsOld.size(); i++) {
     double diff = fabs(probsOld[i] - probsNew[i]);
     if (diff > maxDiff) maxDiff = diff;
-    if (std::isnan(probsNew[i])) return -1; // overflow
   }
   return (maxDiff <= bwMaxDiff) ? 1 : 0; // converged or not
 }
 
-void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
+bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
      int alphabetSize, DirichletMixture dmix, const GapPriors &gp,
      int profileLength, const double *weights,
      double maxIter, double bwMaxDiff) {
 
   // transitions + alphabet
   int width = 7 + alphabetSize;
-  std::vector<double> probsOld(counts.size() + alphabetSize);
-  std::vector<double> probsNew(counts.size() + alphabetSize);
+  std::vector<double> probsOld(counts.size());
+  std::vector<double> probsNew(counts.size());
 
   int rows = profileLength      + 2;
   int cols = ma.alignmentLength + 2;
@@ -767,7 +721,6 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
     /* We aggregate the expected counts over all sequences. */
     for (size_t i = 0; i < counts.size(); i++) counts[i] = 0.0;
-    std::fill(probsNew.begin(), probsNew.end(), 0.0);
 
     unsigned char* seqNoGap = seqsNoGap.data();
 
@@ -780,14 +733,17 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
       forward(seqNoGap, seqLength, probsOld,
         profileLength, width, &v, X, Y, Z);
 
-      // numbers overflowed to infinity
-      if (v > DBL_MAX || std::isnan(v)) break;
+      if (!isfinite(v)) {
+	std::cerr
+	  << "numbers overflowed to infinity in Baum-Welch: quitting\n";
+	return false;
+      }
 
       /* Backward pass, calculate Wbar, Ybar, Zbar. */
       backward(seqNoGap, seqLength, probsOld,
         profileLength, width, Wbar, Ybar, Zbar);
 
-      double wt = weights[idx] / (v * scale);
+      double wt = weights[idx] / (v * scale); // weight for this sequence
 
       /* Calculate and update parameters in new parameter counts. */
       calculateTransitionCounts(counts, profileLength, seqLength,
@@ -804,258 +760,381 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
        Then overwrite the old probabilities with the new ones. */
     termCond = determineTerminationCondition(bwMaxDiff, probsOld, probsNew);
 
-    if (termCond == -1) break; // overflow, keep old probs
-
     std::copy(probsNew.begin(), probsNew.end(), probsOld.begin());
 
-    num_iterations++;
+    std::cerr << "\rIteration " << ++num_iterations << " / " << maxIter << ": "
+              << (termCond ? "    converged" : "not converged");
 
   } while (!termCond && num_iterations < maxIter);
-
+return true;
 }
 
-void printProb(double prob) {
-  if (prob > 0) {
+void printProb(bool isCount, double prob) {
+  if (isCount) {
+    std::cout << "  " << std::left << std::setw(8) << prob << std::right;
+  } else if (prob > 0) {
     std::cout << "  " << abs(log(prob));
   } else {
     std::cout << "        *";
   }
 }
 
-std::vector<std::vector<double>> build_hmm(const char* filename, double symfrac,
-          double ere, double esigma,
-          double bwMaxiter, double bwMaxDiff,
-          bool countOnly, GapPriors gp) {
+void printProfile(const double *probs, const int *columns,
+		  const char *alphabet, int profileLength,
+		  const MultipleAlignment &ma, double neff, bool isCounts) {
+  int alphabetSize = strlen(alphabet);
+  int width = alphabetSize + 7;
+  const double *bgProbs = probs + profileLength * width + 7;
 
-  std::ifstream file;
-  std::istream &in = openFile(file, filename);
-  if (!file) exit(1);
+  std::cout << "HMMER3/f [DUMMER "
+#include "version.hh"
+    "]\n";
+  std::cout << "NAME  " << ma.name << "\n";
+  std::cout << "LENG  " << profileLength << "\n";
+  std::cout << "ALPH  " << (alphabetSize > 4 ? "amino" : "DNA") << "\n";
+  std::cout << "MAP   yes\n";
+  std::cout << "NSEQ  " << ma.sequenceCount << "\n";
+  std::cout << "EFFN  " << neff << "\n";
 
-  unsigned char charToNumber[256];
-  MultipleAlignment ma;
-
-  std::cout << std::fixed;
-
-  std::vector<std::vector<double>> all_counts;
-
-  while (readMultipleAlignment(in, ma)) {
-    bool isProtein = isProteinAlignment(ma);
-    const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
-    int alphabetSize = strlen(alphabet);
-    memset(charToNumber, alphabetSize, 256);
-    setCharToNumber(charToNumber, alphabet);
-    if (!isProtein) setCharToNumber(charToNumber, "ACGU");
-    charToNumber['-'] = charToNumber['.']
-      = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
-
-    int width = 7 + alphabetSize;
-
-    DirichletMixture dmix;
-    dmix.params = isProtein ? blocks9 : wheeler4;
-    dmix.componentCount = (isProtein ? sizeof blocks9 : sizeof wheeler4)
-      / sizeof(double) / (1 + alphabetSize);
-
-    for (auto &i : ma.alignment) i = charToNumber[i];
-
-    markEndGaps(ma, alphabetSize);
-
-    std::vector<double> weights(ma.sequenceCount);
-    makeSequenceWeights(ma, alphabetSize, symfrac, weights.data());
-    double weightSum = std::accumulate(weights.begin(), weights.end(), 0.0);
-
-    std::vector<double> counts;
-    std::vector<int> columns;
-    countEvents(ma, alphabetSize, symfrac, weights.data(), weightSum,
-        counts, columns);
-    int profileLength = columns.size();
-
-    if (!countOnly) {
-      baumWelch(counts, ma, alphabetSize, dmix, gp,
-        profileLength, weights.data(), bwMaxiter, bwMaxDiff);
-    }
-
-    /* As output, we will have the transition counts only. */
-    std::vector<double> paramCounts(counts.size() + alphabetSize);
-    countsToParamCounts(counts.data(), paramCounts.data(),
-      alphabetSize, profileLength);
-
-    for (int i = 0; i <= profileLength; i++) {
-      std::vector<double> transitions_i(7, 0.0);
-      for (int t = 0; t < 7; t++)
-        transitions_i[t] = paramCounts[i * width + t];
-      all_counts.push_back(std::move(transitions_i));
-    }
-
+  std::cout << "HMM     ";
+  for (int i = 0; alphabet[i]; ++i) {
+    std::cout << "     " << alphabet[i] << (isCounts ? "    " : "   ");
   }
+  std::cout << "\n";
 
-  return all_counts;
-}
+  std::cout << "           match   " <<
+    (isCounts ? " notIns    delStart  insEnd    insExt    delEnd    delExt\n"
+     :          "insStart delStart insEnd   insExt   delEnd   delExt\n");
 
-double relativeEntropy(const double *probs,
-		       int alphabetSize, int profileLength) {
-  int probsPerPosition = 7 + alphabetSize;
-  const double *bgProbs = probs + profileLength * probsPerPosition;
-
-  double r = 0;
-  for (int i = 0; i < profileLength; ++i) {
-    for (int j = 0; j < alphabetSize; ++j) {
-      r += probs[j] * log2(probs[j] / bgProbs[j]);
-    }
-    probs += probsPerPosition;
+  if (isCounts) std::cout << std::defaultfloat;
+  std::cout.precision(isCounts ? 3 : 5);
+  for (int i = 0; ; ++i) {
+    const double *p = probs + i * width;
+    std::cout << "        ";
+    for (int j = 0; j < alphabetSize; ++j) printProb(isCounts, bgProbs[j]);
+    std::cout << "\n";
+    std::cout << "        ";
+    for (int j = 0; j < 7; ++j) printProb(isCounts, p[j]);
+    std::cout << "\n";
+    if (i == profileLength) break;
+    std::cout << std::setw(7) << i+1 << " ";
+    for (int j = 0; j < alphabetSize; ++j) printProb(isCounts, p[7 + j]);
+    std::cout << std::setw(7) << columns[i]+1 << "\n";
   }
-  return r;
+  std::cout.precision(6);
+
+  std::cout << "//\n";
 }
 
-std::vector<double> get_relative_entropies(const char* filename, double symfrac,
-          double ere,
-          double bwMaxiter, double bwMaxDiff,
-          bool countOnly, GapPriors gp) {
-
-  std::ifstream file;
-  std::istream &in = openFile(file, filename);
-  if (!file) exit(1);
-
-  unsigned char charToNumber[256];
-  MultipleAlignment ma;
-
-  std::cout << std::fixed;
-
-  std::vector<double> all_entropies;
-
-  while (readMultipleAlignment(in, ma)) {
-    bool isProtein = isProteinAlignment(ma);
-    const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
-    int alphabetSize = strlen(alphabet);
-    memset(charToNumber, alphabetSize, 256);
-    setCharToNumber(charToNumber, alphabet);
-    if (!isProtein) setCharToNumber(charToNumber, "ACGU");
-    charToNumber['-'] = charToNumber['.']
-      = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
-
-    DirichletMixture dmix;
-    dmix.params = isProtein ? blocks9 : wheeler4;
-    dmix.componentCount = (isProtein ? sizeof blocks9 : sizeof wheeler4)
-      / sizeof(double) / (1 + alphabetSize);
-
-    for (auto &i : ma.alignment) i = charToNumber[i];
-
-    markEndGaps(ma, alphabetSize);
-
-    std::vector<double> weights(ma.sequenceCount);
-    makeSequenceWeights(ma, alphabetSize, symfrac, weights.data());
-    double weightSum = std::accumulate(weights.begin(), weights.end(), 0.0);
-
-    std::vector<double> counts;
-    std::vector<int> columns;
-    countEvents(ma, alphabetSize, symfrac, weights.data(), weightSum,
-        counts, columns);
-    int profileLength = columns.size();
-
-    if (!countOnly) {
-      baumWelch(counts, ma, alphabetSize, dmix, gp,
-        profileLength, weights.data(), bwMaxiter, bwMaxDiff);
-    }
-
-    std::vector<double> probs(counts.size() + alphabetSize);
-    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-        counts.data(), probs.data());
-
-    /* As output, we will now have the relative entropies only (one per MSA). */
-    double re = relativeEntropy(probs.data() + 7, alphabetSize, profileLength);
-
-    all_entropies.push_back(re);
-  }
-
-  return all_entropies;
-}
-
-/* C-Types Wrapper */
-
-extern "C" {
-
-/* Need a struct to mimic Python lists */
-struct ArrayDouble {
-    double* data;
-    size_t size;
-};
-
-ArrayDouble build_hmm_c(const char* filename,
-                      double symfrac,
-                      double ere, double esigma,
-                      double bwMaxiter, double bwMaxDiff,
-                      bool countOnly,
-                      GapPriors gp)
-{
-    std::vector<std::vector<double>> probs =
-        build_hmm(filename, symfrac, ere, esigma,
-                  bwMaxiter, bwMaxDiff, countOnly, gp);
-    
-    /* Flatten probs into 1d array for Python... */
-
-    size_t total_size = probs.size() * 7;
-    double* res = static_cast<double*>(std::malloc(total_size * sizeof(double)));
-
-    size_t idx = 0;
-    for (const auto& v : probs) {
-      std::copy(v.begin(), v.end(), res + idx);
-      idx += v.size();
-    }
-
-    ArrayDouble arr;
-    arr.data = res;
-    arr.size = total_size;
-    return arr;
-}
-
-ArrayDouble get_relative_entropies_c(const char* filename,
-                      double symfrac,
-                      double ere,
-                      double bwMaxiter, double bwMaxDiff,
-                      bool countOnly,
-                      GapPriors gp)
-{
-    std::vector<double> entropies =
-        get_relative_entropies(filename, symfrac, ere,
-                  bwMaxiter, bwMaxDiff, countOnly, gp);
-    
-    size_t total_size = entropies.size();
-    double* res = static_cast<double*>(std::malloc(total_size * sizeof(double)));
-    std::copy(entropies.begin(), entropies.end(), res);
-
-    ArrayDouble arr;
-    arr.data = res;
-    arr.size = total_size;
-    return arr;
-
-}
-
-} // extern "C"
-
-// This really only exists for testing purposes...
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <alignment_file>\n";
-        return 1;
+  bool isCounts = false;
+  double symfrac = OPT_symfrac;
+  double ere     = 0;
+  double esigma  = OPT_esigma;
+
+  double bwMaxiter  = OPT_bw_maxiter;
+  double bwMaxDiff = OPT_bw_maxDiff;
+  bool   countOnly   = false;
+
+  const char *dirichletMixtureFileName = 0;
+  const char *gapPriorsFileName = 0;
+  bool pnone = false;
+
+  const char help[] = "\
+usage: dummer-build alignments.stk\n\
+\n\
+Read multiple sequence alignments: write position-specific (-log) probabilities\n\
+of letters, insertions, and deletions.\n\
+\n\
+Options:\n\
+  -h, --help     show this help message and exit\n\
+  -V, --version  show version and exit\n\
+  -v, --verbose  show progress messages\n\
+  --symfrac F    minimum (weighted) non-gap fraction to define a non-insert\n\
+                     position (default: "
+    STR(OPT_symfrac) ")\n\
+  --counts       output weighted counts instead of -log probs (implies --enone)\n\
+\n\
+Options for effective sequence number:\n\
+  --enone        ignore relative entropy: set maximum sequence weight to 1\n\
+  --ere E        aim for this relative entropy per position (default:\n\
+                     " STR(OPT_ere_aa) " for protein, "
+    STR(OPT_ere_nt) " for nucleotide)\n\
+  --esigma E     aim for this relative entropy (default: "
+    STR(OPT_esigma) ")\n\
+\n\
+Baum-Welch options:\n\
+  --maxiter N    maximum number of Baum-Welch iterations (default: "
+    STR(OPT_bw_maxiter) ")\n\
+  --maxdiff X    convergence threshold for Baum-Welch (default: "
+    STR(OPT_bw_maxDiff) ")\n\
+  --countonly    only count events, do not run Baum-Welch\n\
+\n\
+Prior probability options:\n\
+  --dmix         Dirichlet mixture file (esl-mixdchlet format)\n\
+  --gapprior     file with 7 gap pseudocounts:\n\
+                     match insStart delStart insEnd insExtend delEnd delExtend\n\
+  --pnone        Don't use gap priors (i.e. sets gap priors to zero)\n\
+";
+
+  const char sOpts[] = "hVv";
+
+  // negative => not set
+  enum {
+    OPT_SET_MATCH = 1000,
+    OPT_SET_INSBEG,
+    OPT_SET_DELBEG,
+    OPT_SET_INSEND,
+    OPT_SET_INSEXT,
+    OPT_SET_DELEND,
+    OPT_SET_DELEXT
+  };
+
+  double gp_set_match     = -1.0;
+  double gp_set_insStart  = -1.0;
+  double gp_set_delStart  = -1.0;
+  double gp_set_insEnd    = -1.0;
+  double gp_set_insExtend = -1.0;
+  double gp_set_delEnd    = -1.0;
+  double gp_set_delExtend = -1.0;
+
+  static struct option lOpts[] = {
+    {"help",        no_argument,       0, 'h'},
+    {"version",     no_argument,       0, 'V'},
+    {"verbose",     no_argument,       0, 'v'},
+    {"symfrac",     required_argument, 0, 's'},
+    {"counts",      no_argument,       0, 'C'},
+    {"enone",       no_argument,       0, 'n'},
+    {"ere",         required_argument, 0, 'p'},
+    {"esigma",      required_argument, 0, 'e'},
+    {"maxiter",     required_argument, 0, 'N'},
+    {"maxdiff",     required_argument, 0, 'X'},
+    {"countonly",   no_argument,       0, 'c'},
+    {"dmix",        required_argument, 0, 'D'},
+    {"gapprior",    required_argument, 0, 'G'},
+    {"pnone",       no_argument,       0, 'P'},
+    /* individual gap priors (values >= 0) */
+    {"set-match",   required_argument, 0, OPT_SET_MATCH},
+    {"set-insStart",  required_argument, 0, OPT_SET_INSBEG},
+    {"set-delStart",  required_argument, 0, OPT_SET_DELBEG},
+    {"set-insEnd",  required_argument, 0, OPT_SET_INSEND},
+    {"set-insExtend",  required_argument, 0, OPT_SET_INSEXT},
+    {"set-delEnd",  required_argument, 0, OPT_SET_DELEND},
+    {"set-delExtend",  required_argument, 0, OPT_SET_DELEXT},
+    {0, 0, 0, 0}
+  };
+
+  int c;
+  while ((c = getopt_long(argc, argv, sOpts, lOpts, &c)) != -1) {
+    switch (c) {
+    case 'h':
+      std::cout << help;
+      return 0;
+    case 'V':
+      std::cout << "DUMMER "
+#include "version.hh"
+        "\n";
+      return 0;
+    case 'v':
+      ++verbosity;
+      break;
+    case 's':
+      symfrac = strtod(optarg, 0);
+      if (symfrac < 0 || symfrac > 1) return badOpt();
+      break;
+    case 'C':
+      isCounts = true;
+      break;
+    case 'n':
+      esigma = 1e37;
+      break;
+    case 'p':
+      ere = strtod(optarg, 0);
+      if (ere <= 0) return badOpt();
+      break;
+    case 'e':
+      esigma = strtod(optarg, 0);
+      if (esigma <= 0) return badOpt();
+      break;
+    case 'N':
+      bwMaxiter = strtol(optarg, 0, 0);
+      if (bwMaxiter <= 0) return badOpt();
+      break;
+    case 'X':
+      bwMaxDiff = strtod(optarg, 0);
+      if (bwMaxDiff < 0) return badOpt();
+      break;
+    case 'c':
+      countOnly = true;
+      break;
+    case 'D':
+      dirichletMixtureFileName = optarg;
+      break;
+    case 'G':
+      gapPriorsFileName = optarg;
+      break;
+    case 'P':
+      pnone = true;
+      break;
+    case OPT_SET_MATCH:
+      gp_set_match = strtod(optarg, 0);
+      if (gp_set_match < 0) return badOpt();
+      break;
+    case OPT_SET_INSBEG:
+      gp_set_insStart = strtod(optarg, 0);
+      if (gp_set_insStart < 0) return badOpt();
+      break;
+    case OPT_SET_DELBEG:
+      gp_set_delStart = strtod(optarg, 0);
+      if (gp_set_delStart < 0) return badOpt();
+      break;
+    case OPT_SET_INSEND:
+      gp_set_insEnd = strtod(optarg, 0);
+      if (gp_set_insEnd < 0) return badOpt();
+      break;
+    case OPT_SET_INSEXT:
+      gp_set_insExtend = strtod(optarg, 0);
+      if (gp_set_insExtend < 0) return badOpt();
+      break;
+    case OPT_SET_DELEND:
+      gp_set_delEnd = strtod(optarg, 0);
+      if (gp_set_delEnd < 0) return badOpt();
+      break;
+    case OPT_SET_DELEXT:
+      gp_set_delExtend = strtod(optarg, 0);
+      if (gp_set_delExtend < 0) return badOpt();
+      break;
+    case '?':
+      std::cerr << help;
+      return 1;
     }
+  }
 
-    // Use default parameters for testing
-    double symfrac   = OPT_symfrac;
-    double ere       = OPT_ere_aa;
-    double esigma    = OPT_esigma;
-    double bwMaxiter = OPT_bw_maxiter;
-    double bwMaxDiff = OPT_bw_maxDiff;
-    bool countOnly = false;
-    GapPriors gp = {0.9, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01};
+  if (argc - optind != 1) {
+    std::cerr << help;
+    return 1;
+  }
 
-    auto all_probs = build_hmm(argv[1], symfrac, ere, esigma, bwMaxiter, bwMaxDiff, countOnly, gp);
+  DirichletMixture dmix;
+  std::vector<double> dmixParameters;
+  if (dirichletMixtureFileName) {
+    std::ifstream file;
+    std::istream &in = openFile(file, dirichletMixtureFileName);
+    if (!file || !readDirichletMixture(in, dmix, dmixParameters)) return 1;
+  }
 
-    std::cout << "Number of alignments processed: " << all_probs.size() << "\n";
-    for (size_t i = 0; i < all_probs.size(); ++i) {
-      std::cout << "Alignment " << i+1 << " mean transitions: ";
-      for (size_t j = 0; j < all_probs[i].size(); ++j) {
-        std::cout << all_probs[i][j] << " ";
+  GapPriors gapPriors;
+
+  if (gapPriorsFileName) {
+    std::ifstream file;
+    std::istream &in = openFile(file, gapPriorsFileName);
+    if (!file || !readGapPriors(in, gapPriors)) return 1;
+  }
+
+  if (gp_set_match     >= 0) gapPriors.match     = gp_set_match;
+  if (gp_set_insStart  >= 0) gapPriors.insStart  = gp_set_insStart;
+  if (gp_set_delStart  >= 0) gapPriors.delStart  = gp_set_delStart;
+  if (gp_set_insEnd    >= 0) gapPriors.insEnd    = gp_set_insEnd;
+  if (gp_set_insExtend >= 0) gapPriors.insExtend = gp_set_insExtend;
+  if (gp_set_delEnd    >= 0) gapPriors.delEnd    = gp_set_delEnd;
+  if (gp_set_delExtend >= 0) gapPriors.delExtend = gp_set_delExtend;
+
+  std::ifstream file;
+  std::istream &in = openFile(file, argv[optind]);
+  if (!file) return 1;
+
+  unsigned char charToNumber[256];
+  MultipleAlignment ma;
+
+  unsigned long msa_count = 0;
+
+  while (readMultipleAlignment(in, ma)) {
+    std::cout << std::fixed;
+    std::cerr << "MSA #" << ++msa_count << ": " << ma.name << std::endl;
+    bool isProtein = isProteinAlignment(ma);
+    const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
+    int alphabetSize = strlen(alphabet);
+    memset(charToNumber, alphabetSize, 256);
+    setCharToNumber(charToNumber, alphabet);
+    setCharToNumber(charToNumber, isProtein ? "AUDEFGHIO" : "ACGU");
+    charToNumber['-'] = charToNumber['.']
+      = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
+
+    //double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
+
+    if (dirichletMixtureFileName) {
+      int dmixAlphabetSize = dmixParameters.size() / dmix.componentCount - 1;
+      if (dmixAlphabetSize != alphabetSize) {
+	std::cerr << "the Dirichlet mixture file has wrong alphabet size\n";
+	return 1;
       }
-      std::cout << "\n";
+    } else {
+      dmix.params = isProtein ? blocks9 : wheeler4;
+      dmix.componentCount = (isProtein ? sizeof blocks9 : sizeof wheeler4)
+	/ sizeof(double) / (1 + alphabetSize);
     }
-    return 0;
+
+    const GapPriors &gp = (gapPriorsFileName || gp_set_match  >= 0) ? gapPriors :
+      isProtein ? mitchisonAaGapPriors : wheelerNtGapPriors;
+    
+    GapPriors noGapPriors{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    const GapPriors &gpUsed = pnone ? noGapPriors : gp;
+
+    if (verbosity) std::cerr << "Alignment length: "
+			     << ma.alignmentLength << "\n";
+
+    for (auto &i : ma.alignment) i = charToNumber[i];
+
+    markEndGaps(ma, alphabetSize);
+
+    std::vector<double> weights(ma.sequenceCount);
+    makeSequenceWeights(ma, alphabetSize, symfrac, weights.data());
+    double weightSum = std::accumulate(weights.begin(), weights.end(), 0.0);
+
+    if (verbosity > 1) {
+      std::cerr << "Sequence weights:\n";
+      std::cerr.precision(3);
+      for (auto i : weights) std::cerr << i << "\n";
+      std::cerr.precision(6);
+    }
+
+    if (verbosity) std::cerr << "Total weight: " << weightSum << "\n";
+
+    std::vector<double> counts;
+    std::vector<int> columns;
+    countEvents(ma, alphabetSize, symfrac, weights.data(), weightSum, gp,
+		counts, columns);
+    int profileLength = columns.size();
+
+    if (!countOnly) {
+      bool ok = baumWelch(counts, ma, alphabetSize, dmix, gpUsed,
+                          profileLength, weights.data(), bwMaxiter, bwMaxDiff);
+      if (!ok) {
+        std::cerr << "Baum-Welch failed for alignment \"" << ma.name
+                  << "\"; skipping.\n";
+        continue; // move on to the next MSA block
+      }
+    }
+
+    if (isCounts) {
+      printProfile(counts.data(), columns.data(), alphabet, profileLength,
+		   ma, weightSum, isCounts);
+      continue;
+    }
+
+    std::vector<double> probs(counts.size());
+
+    //double targetRelEnt = std::max(esigma, myEre * profileLength);
+    //if (verbosity) std::cerr << "Target relative entropy: "
+	  //	     << targetRelEnt << "\n";
+    //double neff = entropyWeight(dmix, gp, alphabetSize,
+		//		weightSum, targetRelEnt,
+		//		profileLength, counts.data(), probs.data());
+
+    countsToProbs(dmix, gpUsed, alphabetSize, 1e37, profileLength,
+		  counts.data(), probs.data());
+
+    printProfile(probs.data(), columns.data(), alphabet, profileLength,
+		 ma, weightSum, isCounts);
+  }
 }

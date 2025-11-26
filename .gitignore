@@ -43,3 +43,6 @@
 alignments/
 .vscode/
 dummer-build
+
+# don't upload the MSAs for testing!
+*.stk

@@ -1,107 +1,100 @@
 import os
-import ctypes
 import dirichlet
 import numpy as np
+import subprocess
+import tempfile
 
-eps = 1e-10
+eps = 1e-3
 
-# Setting up C-Types for calling the dummer-build shared library
-lib = ctypes.CDLL(os.path.abspath("dummer-build.so"))
+class GapPriors:
+    def __init__(self, match: float, insStart: float, delStart: float,
+                 insEnd: float, insExtend: float,
+                 delEnd: float, delExtend: float):
+        self.match     = match
+        self.insStart  = insStart
+        self.delStart  = delStart
+        self.insEnd    = insEnd
+        self.insExtend = insExtend
+        self.delEnd    = delEnd
+        self.delExtend = delExtend
 
-# Struct mirrors
-class GapPriors(ctypes.Structure):
-    _fields_ = [
-        ("match",     ctypes.c_double),
-        ("insStart",  ctypes.c_double),
-        ("delStart",  ctypes.c_double),
-        ("insEnd",    ctypes.c_double),
-        ("insExtend", ctypes.c_double),
-        ("delEnd",    ctypes.c_double),
-        ("delExtend", ctypes.c_double),
-    ]
+def get_hmm_data(msa: str, priors: GapPriors, method: str, use_counts_only: bool) -> list[list[float]]:
+    # write HMM to a temporary file using the priors passed in
+    out_hmm = tempfile.NamedTemporaryFile(delete=False, suffix=".hmm")
+    out_hmm.close()
+
+    if priors:
+        cmd = [
+            "./bin/dummer-build",
+            "--maxiter", "100",
+            "--set-match", str(priors.match),
+            "--set-insStart", str(priors.insStart),
+            "--set-delStart", str(priors.delStart),
+            "--set-insEnd", str(priors.insEnd),
+            "--set-insExtend", str(priors.insExtend),
+            "--set-delEnd", str(priors.delEnd),
+            "--set-delExtend", str(priors.delExtend),
+            msa
+        ]
+    else:
+        cmd = [
+            "./bin/dummer-build",
+            "--maxiter", "100",
+            "--pnone",
+            msa
+        ]
     
-class ArrayDouble(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.POINTER(ctypes.c_double)),
-        ("len", ctypes.c_size_t),
-    ]
+    if method == "easel":
+        cmd.insert(1, "--counts")
+    
+    if use_counts_only:
+        cmd.insert(1, "--countonly")
+          # end of one HMM; keep going to read the ne
+    try:
+        # run the external build and write its stdout into the temporary HMM file
+        with open(out_hmm.name, "w") as fh_out:
+            subprocess.run(cmd, check=True, stdout=fh_out, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"hmmbuild failed: {e}")
+    
+    probs = []
+    with open(out_hmm.name, "r") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s:
+                continue
+            if s == "//":          # end of one HMM; keep going to read the next
+                continue
+            parts = s.split()
+            if len(parts) != 7:
+                continue
+            try:
+                vals = np.array([float(v) for v in parts], dtype=float)
+            except ValueError:
+                # skip non-numeric lines
+                continue
+            # file stores negative log-probabilities => convert to normal probs
+            if method == "dirichlet":
+                p = np.exp(-vals)
+            else:  # method == "easel"
+                p = np.array([vals[0], vals[3], vals[2], vals[3], vals[4], vals[5], vals[6]])
+            probs.append(p.tolist())
 
-# Signatures
-lib.build_hmm_c.argtypes = [
-    ctypes.c_char_p,         # filename
-    ctypes.c_double,         # symfrac
-    ctypes.c_double,         # ere
-    ctypes.c_double,         # esigma
-    ctypes.c_double,         # bwMaxiter
-    ctypes.c_double,         # bwMaxDiff
-    ctypes.c_bool,           # countOnly  (matches C _Bool)
-    GapPriors,               # by value
-]
-lib.build_hmm_c.restype = ArrayDouble
+    # clean up temporary HMM file
+    try:
+        os.unlink(out_hmm.name)
+    except OSError:
+        pass
 
-# Setting up the initial gap priors
+    print(f"Read {len(probs)} transition probability rows from HMM.")
 
-# These are the initial gap priors for protein sequences,
-# originally trained by Graeme Mitchison in the mid-1990's
-gp = GapPriors(
-    match=0.7939, insStart=0.0278, delStart=0.0135,
-    insEnd=0.1551, insExtend=0.1331,
-    delEnd=0.9002, delExtend=0.5630
-)
+    return probs
 
-# For nucleotide sequences, trained on a portion of
-# the rmark dataset
-#gp = GapPriors(
-#    match=2.0, insStart=0.1, delStart=0.1,
-#    insEnd=0.12, insExtend=0.4,
-#    delEnd=0.5, delExtend=1.0
-#)
-
-# All *.sto or *.stk files in the current directory
-def get_msa_filenames(path: str) -> list[str]:
-    return [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".sto") or f.endswith(".stk")]
-
-def get_transition_probabilities(msas: list[str], priors: GapPriors) -> list[list[float]]:
-    results = []
-    for msa in msas:
-        res = lib.build_hmm_c(
-            msa.encode('utf-8'),
-            0.50,          # symfrac
-            0.59, 45.0,    # ere (protein), esigma
-            1.0, 1e-6,     # bwMaxiter, bwMaxDiff
-            False,         # countOnly -> true for testing!
-            priors
-        )
-        for i in range(int(res.len/7)):
-            probs = []
-            for j in range(7):
-                probs += [res.data[i*7 + j]]
-            results.append(probs)
-    return results
-
-def additive_smoothing(probs: list[list[float]]) -> list[list[float]]:
-    smoothed = []
-    for prob in probs:
-        prob = np.array(prob) + eps
-        prob = prob / prob.sum()
-        smoothed.append(prob.tolist())
-    return np.array(smoothed)
-
-def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
-
-    #probs = np.array(probs) + eps # avoid zeros for dirichlet MLE
+def get_new_gap_priors(gp: GapPriors, probs: list[list[float]]) -> GapPriors:
 
     a_d_g = np.array([prob[0:3] for prob in probs])
     b_bp  = np.array([prob[3:5] for prob in probs])
     e_ep  = np.array([prob[5:7] for prob in probs])
-
-    a_d_g = additive_smoothing(a_d_g)
-    b_bp  = additive_smoothing(b_bp)
-    e_ep  = additive_smoothing(e_ep)
-
-    a_d_g = a_d_g / a_d_g.sum(axis=1, keepdims=True)
-    b_bp  = b_bp  / b_bp.sum(axis=1, keepdims=True)
-    e_ep  = e_ep  / e_ep.sum(axis=1, keepdims=True)
     
     try:
         a = dirichlet.mle(a_d_g)
@@ -114,6 +107,73 @@ def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
         print("-"*100)
         return gp
     
+    return GapPriors(
+        match=a[0], insStart=a[1], delStart=a[2],
+        insEnd=b[0], insExtend=b[1],
+        delEnd=e[0], delExtend=e[1]
+    )
+
+def get_new_gap_priors_easel(probs: list[list[float]]) -> GapPriors:
+
+    # write probs to temporary CSV files
+    tmp_m = tempfile.NamedTemporaryFile(delete=False, suffix="_m.csv")
+    tmp_m.close()
+    tmp_i = tempfile.NamedTemporaryFile(delete=False, suffix="_i.csv")
+    tmp_i.close()
+    tmp_d = tempfile.NamedTemporaryFile(delete=False, suffix="_d.csv")
+    tmp_d.close()
+
+    np.savetxt(tmp_m.name, np.array(probs)[:,:3], delimiter=" ", fmt="%.8f")
+    np.savetxt(tmp_i.name, np.array(probs)[:,3:5], delimiter=" ", fmt="%.8f")
+    np.savetxt(tmp_d.name, np.array(probs)[:,5:7], delimiter=" ", fmt="%.8f")
+
+    tmp_out_m = tempfile.NamedTemporaryFile(delete=False, suffix="_m_out")
+    tmp_out_m.close()
+    tmp_out_i = tempfile.NamedTemporaryFile(delete=False, suffix="_i_out")
+    tmp_out_i.close()
+    tmp_out_d = tempfile.NamedTemporaryFile(delete=False, suffix="_d_out")
+    tmp_out_d.close()
+
+    # run Easel's dirichlet tool on each file
+    cmd_m = ["./easel/miniapps/esl-mixdchlet", "fit", "-s", "7", "1", "3", tmp_m.name, tmp_out_m.name]
+    cmd_i = ["./easel/miniapps/esl-mixdchlet", "fit", "-s", "7", "1", "2", tmp_i.name, tmp_out_i.name]
+    cmd_d = ["./easel/miniapps/esl-mixdchlet", "fit", "-s", "7", "1", "2", tmp_d.name, tmp_out_d.name]
+
+    try:
+        subprocess.run(cmd_m, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd_i, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd_d, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Easel dirichlet tool failed: {e}")
+    print("Successfully fit Dirichlet mixtures using Easel.")
+
+    def _parse_alphas(path: str, expected_dim: int) -> np.ndarray:
+        with open(path, "r") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        if len(lines) < 2:
+            raise RuntimeError(f"Unexpected output format in {path}: need 2 lines")
+        parts = [float(x) for x in lines[1].split()]
+        if len(parts) != expected_dim + 1:
+            raise RuntimeError(
+                f"Unexpected number of fields in {path}: got {len(parts)}, expected {expected_dim + 1}"
+            )
+        # drop the first field (mixture weight), keep the alphas
+        return np.array(parts[1:], dtype=float)
+
+    a = _parse_alphas(tmp_out_m.name, 3)  # match, insStart, delStart
+    b = _parse_alphas(tmp_out_i.name, 2)  # insEnd, insExtend
+    e = _parse_alphas(tmp_out_d.name, 2)  # delEnd, delExtend
+
+    # cleanup temporary files
+    for p in (
+        tmp_m.name, tmp_i.name, tmp_d.name,
+        tmp_out_m.name, tmp_out_i.name, tmp_out_d.name
+    ):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
     return GapPriors(
         match=a[0], insStart=a[1], delStart=a[2],
         insEnd=b[0], insExtend=b[1],
@@ -142,16 +202,72 @@ def print_gap_priors(gp: GapPriors):
     print(f" delExtend: {gp.delExtend:.6f}")
 
 if __name__ == "__main__":
-    msas = get_msa_filenames("alignments")
-    print(f"Found {len(msas)} MSA files: {msas}")
+    msa = "../Pfam-A.filtered_lt50.stk"
+    print(f"Looking at file: {msa}")
+
+    # set to true to run with no initial priors, for one iteration only
+    no_priors = True
+
+    # set this to "dirichlet" to use Dirichlet MLE
+    # set this to "easel" to use Easel's built-in method
+    method = "easel"
+
+    # set this to true to run without Baum-Welch
+    counts_only = False
+
+    # set to true if mean counts should be displayed
+    verbose = False
+
+    # These are the initial gap priors for protein sequences,
+    # originally trained by Graeme Mitchison on an early version of Pfam.
+    gp = GapPriors(
+        match=0.7939, insStart=0.0278, delStart=0.0135,
+        insEnd=0.1331, insExtend=0.9002,
+        delEnd=0.5630, delExtend=0.9002
+    )
     
     max_iterations = 100
+    if no_priors:
+        max_iterations = 1
     
     for iteration in range(max_iterations):
         
-        probs = get_transition_probabilities(msas, gp)
-        new_gp = get_new_gap_priors(probs)
-        
+        if no_priors:
+            probs = get_hmm_data(msa, None, method, counts_only)
+        else:
+            probs = get_hmm_data(msa, gp, method, counts_only)
+
+        # pseudocounts are not taken into account by hmmbuild when using --return-counts
+        # we add them in here manually for Easel method
+        if not no_priors and method == "easel":
+            for row in probs:
+                row[0] = row[0] + gp.match
+                row[1] = row[1] + gp.insStart
+                row[2] = row[2] + gp.delStart
+                row[3] = row[3] + gp.insEnd
+                row[4] = row[4] + gp.insExtend
+                row[5] = row[5] + gp.delEnd
+                row[6] = row[6] + gp.delExtend
+
+        if verbose:
+            # compute and print mean of each of the 7 probability columns
+            arr = np.array(probs, dtype=float)
+            if arr.size == 0:
+                print("No probability rows to average.")
+            else:
+                mean_probs = arr.mean(axis=0)
+                names = ["match", "insStart", "delStart", "insEnd", "insExtend", "delEnd", "delExtend"]
+                print()
+                print("\n".join(f"{n}: {v:.6f}" for n, v in zip(names, mean_probs)))
+                print()
+
+        if method == "dirichlet":
+            new_gp = get_new_gap_priors(gp, probs)
+        elif method == "easel":
+            new_gp = get_new_gap_priors_easel(probs)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
         max_diff = get_max_diff(gp, new_gp)
         
         gp = new_gp
