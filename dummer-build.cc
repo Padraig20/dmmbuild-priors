@@ -1124,6 +1124,7 @@ Prior probability options:\n\
 
     std::vector<double> probs(counts.size());
 
+    // we don't use relative entropy weighting for estimating priors!
     //double targetRelEnt = std::max(esigma, myEre * profileLength);
     //if (verbosity) std::cerr << "Target relative entropy: "
 	  //	     << targetRelEnt << "\n";
