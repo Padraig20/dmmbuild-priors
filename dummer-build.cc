@@ -23,6 +23,10 @@
 
 #include <getopt.h>
 
+#include <climits>
+
+#define INF INT_MAX
+
 // Copied from HMMER 3.4:
 #define OPT_symfrac 0.50
 #define OPT_ere_aa  0.59
@@ -1026,7 +1030,7 @@ Prior probability options:\n\
     charToNumber['-'] = charToNumber['.']
       = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
 
-    double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
+    //double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
 
     if (dirichletMixtureFileName) {
       int dmixAlphabetSize = dmixParameters.size() / dmix.componentCount - 1;
@@ -1088,14 +1092,10 @@ Prior probability options:\n\
 
     std::vector<double> probs(counts.size());
 
-    double targetRelEnt = std::max(esigma, myEre * profileLength);
-    if (verbosity) std::cerr << "Target relative entropy: "
-			     << targetRelEnt << "\n";
-    double neff = entropyWeight(dmix, gp, alphabetSize,
-				weightSum, targetRelEnt,
-				profileLength, counts.data(), probs.data());
+    countsToProbs(dmix, gp, alphabetSize, INF, profileLength,
+        counts.data(), probs.data());
 
     printProfile(probs.data(), columns.data(), alphabet, profileLength,
-		 ma, neff, isCounts);
+		 ma, INF, isCounts);
   }
 }
