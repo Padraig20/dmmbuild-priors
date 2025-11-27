@@ -18,31 +18,17 @@ class GapPriors:
         self.delEnd    = delEnd
         self.delExtend = delExtend
 
-def get_hmm_data(msa: str, priors: GapPriors, method: str, use_counts_only: bool) -> list[list[float]]:
+def get_hmm_data(msa: str, method: str, use_counts_only: bool) -> list[list[float]]:
     # write HMM to a temporary file using the priors passed in
     out_hmm = tempfile.NamedTemporaryFile(delete=False, suffix=".hmm")
     out_hmm.close()
 
-    if priors:
-        cmd = [
-            "./bin/dummer-build",
-            "--maxiter", "100",
-            "--set-match", str(priors.match),
-            "--set-insStart", str(priors.insStart),
-            "--set-delStart", str(priors.delStart),
-            "--set-insEnd", str(priors.insEnd),
-            "--set-insExtend", str(priors.insExtend),
-            "--set-delEnd", str(priors.delEnd),
-            "--set-delExtend", str(priors.delExtend),
-            msa
-        ]
-    else:
-        cmd = [
-            "./bin/dummer-build",
-            "--maxiter", "100",
-            "--pnone",
-            msa
-        ]
+    cmd = [
+        "./bin/dummer-build",
+        "--maxiter", "100",
+        "--pnone",
+        msa
+    ]
     
     if method == "easel":
         cmd.insert(1, "--counts")
@@ -90,7 +76,7 @@ def get_hmm_data(msa: str, priors: GapPriors, method: str, use_counts_only: bool
 
     return probs
 
-def get_new_gap_priors(gp: GapPriors, probs: list[list[float]]) -> GapPriors:
+def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
 
     a_d_g = np.array([prob[0:3] for prob in probs])
     b_bp  = np.array([prob[3:5] for prob in probs])
@@ -103,9 +89,9 @@ def get_new_gap_priors(gp: GapPriors, probs: list[list[float]]) -> GapPriors:
     except Exception as ex:
         print("-"*100)
         print(f"Exception during Dirichlet MLE: {ex}")
-        print(f"Most likely we're simply done: Returning previous gap priors...")
+        print(f"No idea what happened. Terminating...")
         print("-"*100)
-        return gp
+        exit(1)
     
     return GapPriors(
         match=a[0], insStart=a[1], delStart=a[2],
@@ -179,18 +165,6 @@ def get_new_gap_priors_easel(probs: list[list[float]]) -> GapPriors:
         insEnd=b[0], insExtend=b[1],
         delEnd=e[0], delExtend=e[1]
     )
-    
-def get_max_diff(gp1: GapPriors, gp2: GapPriors) -> float:
-    diffs = [
-        abs(gp1.match     - gp2.match),
-        abs(gp1.insStart  - gp2.insStart),
-        abs(gp1.delStart  - gp2.delStart),
-        abs(gp1.insEnd    - gp2.insEnd),
-        abs(gp1.insExtend - gp2.insExtend),
-        abs(gp1.delEnd    - gp2.delEnd),
-        abs(gp1.delExtend - gp2.delExtend),
-    ]
-    return max(diffs)
 
 def print_gap_priors(gp: GapPriors):
     print(f" match:     {gp.match:.6f}")
@@ -205,9 +179,6 @@ if __name__ == "__main__":
     msa = "../Pfam-A.filtered_lt50.stk"
     print(f"Looking at file: {msa}")
 
-    # set to true to run with no initial priors, for one iteration only
-    no_priors = True
-
     # set this to "dirichlet" to use Dirichlet MLE
     # set this to "easel" to use Easel's built-in method
     method = "easel"
@@ -217,70 +188,30 @@ if __name__ == "__main__":
 
     # set to true if mean counts should be displayed
     verbose = False
+                
+    probs = get_hmm_data(msa, method, counts_only)
 
-    # These are the initial gap priors for protein sequences,
-    # originally trained by Graeme Mitchison on an early version of Pfam.
-    gp = GapPriors(
-        match=0.7939, insStart=0.0278, delStart=0.0135,
-        insEnd=0.1331, insExtend=0.9002,
-        delEnd=0.5630, delExtend=0.9002
-    )
-    
-    max_iterations = 100
-    if no_priors:
-        max_iterations = 1
-    
-    for iteration in range(max_iterations):
-        
-        if no_priors:
-            probs = get_hmm_data(msa, None, method, counts_only)
+    if verbose:
+        # compute and print mean of each of the 7 probability columns
+        arr = np.array(probs, dtype=float)
+        if arr.size == 0:
+            print("No probability rows to average.")
         else:
-            probs = get_hmm_data(msa, gp, method, counts_only)
+            mean_probs = arr.mean(axis=0)
+            names = ["match", "insStart", "delStart", "insEnd", "insExtend", "delEnd", "delExtend"]
+            print()
+            print("\n".join(f"{n}: {v:.6f}" for n, v in zip(names, mean_probs)))
+            print()
 
-        # pseudocounts are not taken into account by hmmbuild when using --return-counts
-        # we add them in here manually for Easel method
-        if not no_priors and method == "easel":
-            for row in probs:
-                row[0] = row[0] + gp.match
-                row[1] = row[1] + gp.insStart
-                row[2] = row[2] + gp.delStart
-                row[3] = row[3] + gp.insEnd
-                row[4] = row[4] + gp.insExtend
-                row[5] = row[5] + gp.delEnd
-                row[6] = row[6] + gp.delExtend
-
-        if verbose:
-            # compute and print mean of each of the 7 probability columns
-            arr = np.array(probs, dtype=float)
-            if arr.size == 0:
-                print("No probability rows to average.")
-            else:
-                mean_probs = arr.mean(axis=0)
-                names = ["match", "insStart", "delStart", "insEnd", "insExtend", "delEnd", "delExtend"]
-                print()
-                print("\n".join(f"{n}: {v:.6f}" for n, v in zip(names, mean_probs)))
-                print()
-
-        if method == "dirichlet":
-            new_gp = get_new_gap_priors(gp, probs)
-        elif method == "easel":
-            new_gp = get_new_gap_priors_easel(probs)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-        max_diff = get_max_diff(gp, new_gp)
-        
-        gp = new_gp
-        
-        print(f"Iteration {iteration+1}:")
-        print_gap_priors(gp)
-        
-        if max_diff < eps:
-            print("Converged.")
-            break
+    if method == "dirichlet":
+        gp = get_new_gap_priors(probs)
+    elif method == "easel":
+        gp = get_new_gap_priors_easel(probs)
+    else:
+        raise ValueError(f"Unknown method: {method}")
     
     print()
     print("="*100)
     print()
-    print(f"Final gap priors after {iteration+1} iterations:")
+        
     print_gap_priors(gp)

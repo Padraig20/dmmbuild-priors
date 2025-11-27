@@ -17,7 +17,6 @@
 
 #include <assert.h>
 #include <ctype.h>
-#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,7 +141,6 @@ void applyDirichletMixture(DirichletMixture dmix,
   normalize(probEstimate, alphabetSize);
 }
 
-
 void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
 		      const double *counts, double *probs) {
   double match  = counts[0]; //gamma
@@ -212,6 +210,33 @@ double relativeEntropy(const double *probs,
     probs += probsPerPosition;
   }
   return r;
+}
+
+double entropyWeight(DirichletMixture dmix, const GapPriors &gp,
+		     int alphabetSize, double rangeEnd, double targetRelEnt,
+		     int profileLength, const double *counts, double *probs) {
+  double rangeBeg = 0;
+  double rangeLen = rangeEnd;
+  double maxCountSum = 1e37;  // start with no limit on total weight
+
+  while (1) {
+    countsToProbs(dmix, gp, alphabetSize, maxCountSum, profileLength,
+		  counts, probs);
+    if (verbosity > 1) {
+      const double *bgProbs = probs + profileLength * (7 + alphabetSize) + 7;
+      std::cerr << "Background letter probabilities:" << std::setprecision(3);
+      for (int i = 0; i < alphabetSize; ++i) std::cerr << " " << bgProbs[i];
+      std::cerr << std::setprecision(6) << "\n";
+    }
+    double r = relativeEntropy(probs + 7, alphabetSize, profileLength);
+    if (verbosity) std::cerr << "Max total weight: " << maxCountSum
+			     << "  Relative entropy: " << r << "\n";
+    if (maxCountSum >= rangeEnd && r <= targetRelEnt) return rangeEnd;
+    if (rangeLen < 0.01) return maxCountSum;
+    if (r < targetRelEnt) rangeBeg = maxCountSum;
+    rangeLen /= 2;
+    maxCountSum = rangeBeg + rangeLen;
+  }
 }
 
 std::istream &readGapPriors(std::istream &in, GapPriors &gp) {
@@ -384,7 +409,6 @@ void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
     for (int j = 0; j < ma.sequenceCount; ++j) weights[j] /= maxWeight;
   }
 }
-
 
 void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
 		 const double *weights, double weightSum, const GapPriors &gp,
@@ -766,7 +790,13 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
               << (termCond ? "    converged" : "not converged");
 
   } while (!termCond && num_iterations < maxIter);
-return true;
+
+  std::cerr << "\nError tolerance: " << bwMaxDiff
+            << ", iterations: " << num_iterations << ", "
+            << (termCond ? "Baum-Welch converged" : "Baum-Welch not converged")
+            << "\n";
+
+  return false;
 }
 
 void printProb(bool isCount, double prob) {
@@ -874,53 +904,26 @@ Prior probability options:\n\
   --dmix         Dirichlet mixture file (esl-mixdchlet format)\n\
   --gapprior     file with 7 gap pseudocounts:\n\
                      match insStart delStart insEnd insExtend delEnd delExtend\n\
-  --pnone        Don't use gap priors (i.e. sets gap priors to zero)\n\
+  --pnone        don't use any prior probabilities (implies --enone)\n\
 ";
 
   const char sOpts[] = "hVv";
 
-  // negative => not set
-  enum {
-    OPT_SET_MATCH = 1000,
-    OPT_SET_INSBEG,
-    OPT_SET_DELBEG,
-    OPT_SET_INSEND,
-    OPT_SET_INSEXT,
-    OPT_SET_DELEND,
-    OPT_SET_DELEXT
-  };
-
-  double gp_set_match     = -1.0;
-  double gp_set_insStart  = -1.0;
-  double gp_set_delStart  = -1.0;
-  double gp_set_insEnd    = -1.0;
-  double gp_set_insExtend = -1.0;
-  double gp_set_delEnd    = -1.0;
-  double gp_set_delExtend = -1.0;
-
   static struct option lOpts[] = {
-    {"help",        no_argument,       0, 'h'},
-    {"version",     no_argument,       0, 'V'},
-    {"verbose",     no_argument,       0, 'v'},
-    {"symfrac",     required_argument, 0, 's'},
-    {"counts",      no_argument,       0, 'C'},
-    {"enone",       no_argument,       0, 'n'},
-    {"ere",         required_argument, 0, 'p'},
-    {"esigma",      required_argument, 0, 'e'},
-    {"maxiter",     required_argument, 0, 'N'},
-    {"maxdiff",     required_argument, 0, 'X'},
-    {"countonly",   no_argument,       0, 'c'},
-    {"dmix",        required_argument, 0, 'D'},
-    {"gapprior",    required_argument, 0, 'G'},
-    {"pnone",       no_argument,       0, 'P'},
-    /* individual gap priors (values >= 0) */
-    {"set-match",   required_argument, 0, OPT_SET_MATCH},
-    {"set-insStart",  required_argument, 0, OPT_SET_INSBEG},
-    {"set-delStart",  required_argument, 0, OPT_SET_DELBEG},
-    {"set-insEnd",  required_argument, 0, OPT_SET_INSEND},
-    {"set-insExtend",  required_argument, 0, OPT_SET_INSEXT},
-    {"set-delEnd",  required_argument, 0, OPT_SET_DELEND},
-    {"set-delExtend",  required_argument, 0, OPT_SET_DELEXT},
+    {"help",      no_argument,       0, 'h'},
+    {"version",   no_argument,       0, 'V'},
+    {"verbose",   no_argument,       0, 'v'},
+    {"symfrac",   required_argument, 0, 's'},
+    {"counts",    no_argument,       0, 'C'},
+    {"enone",     no_argument,       0, 'n'},
+    {"ere",       required_argument, 0, 'p'},
+    {"esigma",    required_argument, 0, 'e'},
+    {"maxiter",   required_argument, 0, 'N'},
+    {"maxdiff",   required_argument, 0, 'X'},
+    {"countonly", no_argument,       0, 'c'},
+    {"dmix",      required_argument, 0, 'D'},
+    {"gapprior",  required_argument, 0, 'G'},
+    {"pnone",     no_argument,       0, 'P'},
     {0, 0, 0, 0}
   };
 
@@ -975,34 +978,7 @@ Prior probability options:\n\
       break;
     case 'P':
       pnone = true;
-      break;
-    case OPT_SET_MATCH:
-      gp_set_match = strtod(optarg, 0);
-      if (gp_set_match < 0) return badOpt();
-      break;
-    case OPT_SET_INSBEG:
-      gp_set_insStart = strtod(optarg, 0);
-      if (gp_set_insStart < 0) return badOpt();
-      break;
-    case OPT_SET_DELBEG:
-      gp_set_delStart = strtod(optarg, 0);
-      if (gp_set_delStart < 0) return badOpt();
-      break;
-    case OPT_SET_INSEND:
-      gp_set_insEnd = strtod(optarg, 0);
-      if (gp_set_insEnd < 0) return badOpt();
-      break;
-    case OPT_SET_INSEXT:
-      gp_set_insExtend = strtod(optarg, 0);
-      if (gp_set_insExtend < 0) return badOpt();
-      break;
-    case OPT_SET_DELEND:
-      gp_set_delEnd = strtod(optarg, 0);
-      if (gp_set_delEnd < 0) return badOpt();
-      break;
-    case OPT_SET_DELEXT:
-      gp_set_delExtend = strtod(optarg, 0);
-      if (gp_set_delExtend < 0) return badOpt();
+      esigma = 1e37;
       break;
     case '?':
       std::cerr << help;
@@ -1023,21 +999,12 @@ Prior probability options:\n\
     if (!file || !readDirichletMixture(in, dmix, dmixParameters)) return 1;
   }
 
-  GapPriors gapPriors;
-
+  GapPriors gapPriors = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   if (gapPriorsFileName) {
     std::ifstream file;
     std::istream &in = openFile(file, gapPriorsFileName);
     if (!file || !readGapPriors(in, gapPriors)) return 1;
   }
-
-  if (gp_set_match     >= 0) gapPriors.match     = gp_set_match;
-  if (gp_set_insStart  >= 0) gapPriors.insStart  = gp_set_insStart;
-  if (gp_set_delStart  >= 0) gapPriors.delStart  = gp_set_delStart;
-  if (gp_set_insEnd    >= 0) gapPriors.insEnd    = gp_set_insEnd;
-  if (gp_set_insExtend >= 0) gapPriors.insExtend = gp_set_insExtend;
-  if (gp_set_delEnd    >= 0) gapPriors.delEnd    = gp_set_delEnd;
-  if (gp_set_delExtend >= 0) gapPriors.delExtend = gp_set_delExtend;
 
   std::ifstream file;
   std::istream &in = openFile(file, argv[optind]);
@@ -1047,7 +1014,6 @@ Prior probability options:\n\
   MultipleAlignment ma;
 
   unsigned long msa_count = 0;
-
   while (readMultipleAlignment(in, ma)) {
     std::cout << std::fixed;
     std::cerr << "MSA #" << ++msa_count << ": " << ma.name << std::endl;
@@ -1060,7 +1026,7 @@ Prior probability options:\n\
     charToNumber['-'] = charToNumber['.']
       = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
 
-    //double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
+    double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
 
     if (dirichletMixtureFileName) {
       int dmixAlphabetSize = dmixParameters.size() / dmix.componentCount - 1;
@@ -1068,17 +1034,19 @@ Prior probability options:\n\
 	std::cerr << "the Dirichlet mixture file has wrong alphabet size\n";
 	return 1;
       }
+    } else if (pnone) {
+      dmixParameters.resize(1 + alphabetSize);
+      dmixParameters[0] = 1;
+      dmix.params = dmixParameters.data();
+      dmix.componentCount = 1;
     } else {
       dmix.params = isProtein ? blocks9 : wheeler4;
       dmix.componentCount = (isProtein ? sizeof blocks9 : sizeof wheeler4)
 	/ sizeof(double) / (1 + alphabetSize);
     }
 
-    const GapPriors &gp = (gapPriorsFileName || gp_set_match  >= 0) ? gapPriors :
+    const GapPriors &gp = (gapPriorsFileName || pnone) ? gapPriors :
       isProtein ? mitchisonAaGapPriors : wheelerNtGapPriors;
-    
-    GapPriors noGapPriors{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    const GapPriors &gpUsed = pnone ? noGapPriors : gp;
 
     if (verbosity) std::cerr << "Alignment length: "
 			     << ma.alignmentLength << "\n";
@@ -1107,13 +1075,9 @@ Prior probability options:\n\
     int profileLength = columns.size();
 
     if (!countOnly) {
-      bool ok = baumWelch(counts, ma, alphabetSize, dmix, gpUsed,
-                          profileLength, weights.data(), bwMaxiter, bwMaxDiff);
-      if (!ok) {
-        std::cerr << "Baum-Welch failed for alignment \"" << ma.name
-                  << "\"; skipping.\n";
-        continue; // move on to the next MSA block
-      }
+      bool term = baumWelch(counts, ma, alphabetSize, dmix, gp,
+          profileLength, weights.data(), bwMaxiter, bwMaxDiff);
+      if (term) continue;
     }
 
     if (isCounts) {
@@ -1124,18 +1088,14 @@ Prior probability options:\n\
 
     std::vector<double> probs(counts.size());
 
-    // we don't use relative entropy weighting for estimating priors!
-    //double targetRelEnt = std::max(esigma, myEre * profileLength);
-    //if (verbosity) std::cerr << "Target relative entropy: "
-	  //	     << targetRelEnt << "\n";
-    //double neff = entropyWeight(dmix, gp, alphabetSize,
-		//		weightSum, targetRelEnt,
-		//		profileLength, counts.data(), probs.data());
-
-    countsToProbs(dmix, gpUsed, alphabetSize, 1e37, profileLength,
-		  counts.data(), probs.data());
+    double targetRelEnt = std::max(esigma, myEre * profileLength);
+    if (verbosity) std::cerr << "Target relative entropy: "
+			     << targetRelEnt << "\n";
+    double neff = entropyWeight(dmix, gp, alphabetSize,
+				weightSum, targetRelEnt,
+				profileLength, counts.data(), probs.data());
 
     printProfile(probs.data(), columns.data(), alphabet, profileLength,
-		 ma, weightSum, isCounts);
+		 ma, neff, isCounts);
   }
 }
