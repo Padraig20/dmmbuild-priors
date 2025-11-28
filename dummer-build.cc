@@ -62,10 +62,11 @@ void setCharToNumber(unsigned char *charToNumber, const char *alphabet) {
   }
 }
 
-void normalize(double *x, int n) {
+bool normalize(double *x, int n) {
   double s = std::accumulate(x, x + n, 0.0);
-  assert(s > 0);
+  if (s <= 0.0) return false;
   for (int i = 0; i < n; ++i) x[i] /= s;
+  return true;
 }
 
 // some MSAs (if --pnone is used) may have zero probabilities
@@ -82,12 +83,12 @@ double geometricMean(const double *values, int length, int step) {
   return exp(s / length);
 }
 
-void setBackgroundProbs(double *bgProbs, const double *probs,
+bool setBackgroundProbs(double *bgProbs, const double *probs,
 			int alphabetSize, int profileLength) {
   for (int i = 0; i < alphabetSize; ++i) {
     bgProbs[i] = geometricMean(probs + i, profileLength, 7 + alphabetSize);
   }
-  normalize(bgProbs, alphabetSize);
+  return normalize(bgProbs, alphabetSize);
 }
 
 // Probabilities are estimated from counts and a prior probability
@@ -112,7 +113,7 @@ double getProb(double count1, double count2,
   return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
 }
 
-void applyDirichletMixture(DirichletMixture dmix,
+bool applyDirichletMixture(DirichletMixture dmix,
 			   int alphabetSize, double maxCountSum,
 			   const double *counts, double *probEstimate) {
   int componentSize = 1 + alphabetSize;  // 1 mixture coefficient + alphas
@@ -142,7 +143,7 @@ void applyDirichletMixture(DirichletMixture dmix,
     }
   }
 
-  normalize(probEstimate, alphabetSize);
+  return normalize(probEstimate, alphabetSize);
 }
 
 void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
@@ -173,10 +174,12 @@ void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   probs[6] = e;  // deletion extend probability
 }
 
-void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
+bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
 		   int alphabetSize, double maxCountSum,
 		   int profileLength, const double *counts, double *probs) {
   int countsPerPosition = 7 + alphabetSize;
+
+  bool success = true;
 
   for (int i = 0; ; ++i) {
     const double *c = counts + i * countsPerPosition;
@@ -186,7 +189,7 @@ void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
 
     if (i == profileLength) break;
 
-    applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7);
+    success &= applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7);
   }
 
   // These gap probabilities are never used - set them similarly to HMMER:
@@ -198,7 +201,9 @@ void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
   p[0] = 1 - p[1];  // match
   p[2] = 0;         // delStart
 
-  setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
+  success &= setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
+
+  return success;
 }
 
 double relativeEntropy(const double *probs,
@@ -214,33 +219,6 @@ double relativeEntropy(const double *probs,
     probs += probsPerPosition;
   }
   return r;
-}
-
-double entropyWeight(DirichletMixture dmix, const GapPriors &gp,
-		     int alphabetSize, double rangeEnd, double targetRelEnt,
-		     int profileLength, const double *counts, double *probs) {
-  double rangeBeg = 0;
-  double rangeLen = rangeEnd;
-  double maxCountSum = 1e37;  // start with no limit on total weight
-
-  while (1) {
-    countsToProbs(dmix, gp, alphabetSize, maxCountSum, profileLength,
-		  counts, probs);
-    if (verbosity > 1) {
-      const double *bgProbs = probs + profileLength * (7 + alphabetSize) + 7;
-      std::cerr << "Background letter probabilities:" << std::setprecision(3);
-      for (int i = 0; i < alphabetSize; ++i) std::cerr << " " << bgProbs[i];
-      std::cerr << std::setprecision(6) << "\n";
-    }
-    double r = relativeEntropy(probs + 7, alphabetSize, profileLength);
-    if (verbosity) std::cerr << "Max total weight: " << maxCountSum
-			     << "  Relative entropy: " << r << "\n";
-    if (maxCountSum >= rangeEnd && r <= targetRelEnt) return rangeEnd;
-    if (rangeLen < 0.01) return maxCountSum;
-    if (r < targetRelEnt) rangeBeg = maxCountSum;
-    rangeLen /= 2;
-    maxCountSum = rangeBeg + rangeLen;
-  }
 }
 
 std::istream &readGapPriors(std::istream &in, GapPriors &gp) {
@@ -739,8 +717,10 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
   std::vector<int>  seqsLengths(ma.sequenceCount, 0);
   getSequenceWithoutGaps(ma, alphabetSize, seqsNoGap, seqsLengths);
 
-  countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-      counts.data(), probsOld.data());
+  if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+      counts.data(), probsOld.data())) {
+    return false;
+  }
 
   int termCond;
   int num_iterations = 0;
@@ -781,8 +761,10 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
     }
 
     /* Turn the parameter counts into probabilities via priors. */
-    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-        counts.data(), probsNew.data());
+    if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+        counts.data(), probsNew.data())) {
+      return false;
+    }
 
     /* Determine termination condition.
        Then overwrite the old probabilities with the new ones. */
@@ -1081,7 +1063,10 @@ Prior probability options:\n\
     if (!countOnly) {
       bool term = baumWelch(counts, ma, alphabetSize, dmix, gp,
           profileLength, weights.data(), bwMaxiter, bwMaxDiff);
-      if (term) continue;
+      if (term) {
+        std::cerr << "Failed, quitting!" << std::endl;
+        continue;
+      }
     }
 
     if (isCounts) {
@@ -1092,8 +1077,11 @@ Prior probability options:\n\
 
     std::vector<double> probs(counts.size());
 
-    countsToProbs(dmix, gp, alphabetSize, INF, profileLength,
-        counts.data(), probs.data());
+    if (!countsToProbs(dmix, gp, alphabetSize, INF, profileLength,
+        counts.data(), probs.data())) {
+      std::cerr << "Failed, quitting!" << std::endl;
+      continue;
+    }
 
     printProfile(probs.data(), columns.data(), alphabet, profileLength,
 		 ma, INF, isCounts);
