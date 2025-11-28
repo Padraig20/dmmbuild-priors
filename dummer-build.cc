@@ -146,7 +146,7 @@ bool applyDirichletMixture(DirichletMixture dmix,
   return normalize(probEstimate, alphabetSize);
 }
 
-void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
+bool gapCountsToProbs(const GapPriors &gp, double maxCountSum,
 		      const double *counts, double *probs) {
   double match  = counts[0]; //gamma
   double notIns = counts[1]; //gamma + delta + tau = etap + oldGamma + epsilonp
@@ -158,7 +158,7 @@ void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   double delExt = counts[6]; //epsilon
 
   double gpNotIns = gp.match + gp.delStart;
-  assert(notIns > 0);
+  if (notIns <= 0) return false;
   double a = getProb(insBeg, notIns, gp.insStart, gpNotIns, maxCountSum);
   double d = getProb(delBeg, match, gp.delStart, gp.match, maxCountSum);
   probs[1] = a;  // insertion start probability
@@ -172,6 +172,7 @@ void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   double e = getProb(delExt, delEnd, gp.delExtend, gp.delEnd, maxCountSum);
   probs[5] = 1 - e;
   probs[6] = e;  // deletion extend probability
+  return true;
 }
 
 bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
@@ -185,7 +186,7 @@ bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
     const double *c = counts + i * countsPerPosition;
     /* */ double *p = probs  + i * countsPerPosition;
 
-    gapCountsToProbs(gp, maxCountSum, c, p);
+    success &= gapCountsToProbs(gp, maxCountSum, c, p);
 
     if (i == profileLength) break;
 
