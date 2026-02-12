@@ -63,10 +63,11 @@ void setCharToNumber(unsigned char *charToNumber, const char *alphabet) {
   }
 }
 
-void normalize(double *x, int n) {
+bool normalize(double *x, int n) {
   double s = std::accumulate(x, x + n, 0.0);
-  assert(s > 0);
+  if (s <= 0.0) return false; // failure
   for (int i = 0; i < n; ++i) x[i] /= s;
+  return true; // success
 }
 
 // some MSAs (if --pnone is used) may have zero probabilities
@@ -84,12 +85,12 @@ double geometricMean(const double *values, int length, int step) {
   return exp(s / length);
 }
 
-void setBackgroundProbs(double *bgProbs, const double *probs,
+bool setBackgroundProbs(double *bgProbs, const double *probs,
 			int alphabetSize, int profileLength) {
   for (int i = 0; i < alphabetSize; ++i) {
     bgProbs[i] = geometricMean(probs + i, profileLength, 7 + alphabetSize);
   }
-  normalize(bgProbs, alphabetSize);
+  return normalize(bgProbs, alphabetSize);
 }
 
 // Probabilities are estimated from counts and a prior probability
@@ -114,7 +115,7 @@ double getProb(double count1, double count2,
   return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
 }
 
-void applyDirichletMixture(DirichletMixture dmix,
+bool applyDirichletMixture(DirichletMixture dmix,
 			   int alphabetSize, double maxCountSum,
 			   const double *counts, double *probEstimate) {
   int componentSize = 1 + alphabetSize;  // 1 mixture coefficient + alphas
@@ -144,7 +145,7 @@ void applyDirichletMixture(DirichletMixture dmix,
     }
   }
 
-  normalize(probEstimate, alphabetSize);
+  return normalize(probEstimate, alphabetSize);
 }
 
 void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
@@ -175,7 +176,7 @@ void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   probs[6] = e;  // deletion extend probability
 }
 
-void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
+bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
 		   int alphabetSize, double maxCountSum,
 		   int profileLength, const double *counts, double *probs) {
   int countsPerPosition = 7 + alphabetSize;
@@ -188,7 +189,7 @@ void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
 
     if (i == profileLength) break;
 
-    applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7);
+    if (!applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7)) return false; // failure
   }
 
   // These gap probabilities are never used - set them similarly to HMMER:
@@ -200,7 +201,8 @@ void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
   p[0] = 1 - p[1];  // match
   p[2] = 0;         // delStart
 
-  setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
+  if (!setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength)) return false; // failure
+  return true; // success
 }
 
 double relativeEntropy(const double *probs,
@@ -226,8 +228,8 @@ double entropyWeight(DirichletMixture dmix, const GapPriors &gp,
   double maxCountSum = 1e37;  // start with no limit on total weight
 
   while (1) {
-    countsToProbs(dmix, gp, alphabetSize, maxCountSum, profileLength,
-		  counts, probs);
+    if (!countsToProbs(dmix, gp, alphabetSize, maxCountSum, profileLength,
+		  counts, probs)) return -1; // failure
     if (verbosity > 1) {
       const double *bgProbs = probs + profileLength * (7 + alphabetSize) + 7;
       std::cerr << "Background letter probabilities:" << std::setprecision(3);
@@ -761,7 +763,7 @@ int determineTerminationCondition(double bwMaxDiff,
   return (maxDiff <= bwMaxDiff) ? 1 : 0; // converged or not
 }
 
-void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
+bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
      int alphabetSize, DirichletMixture dmix, const GapPriors &gp,
      int profileLength, const double *weights,
      double maxIter, double bwMaxDiff) {
@@ -786,8 +788,11 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
   std::vector<int>  seqsLengths(ma.sequenceCount, 0);
   getSequenceWithoutGaps(ma, alphabetSize, seqsNoGap, seqsLengths);
 
-  countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-      counts.data(), probsOld.data());
+  if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+      counts.data(), probsOld.data())) {
+    std::cerr << "Failed to convert counts to probabilities\n";
+    return false; // failure
+  }
 
   int termCond;
   int num_iterations = 0;
@@ -810,7 +815,7 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
       if (!isfinite(v)) {
 	std::cerr
 	  << "numbers overflowed to infinity in Baum-Welch: quitting\n";
-	exit(1);
+	return false; // failure
       }
 
       /* Backward pass, calculate Wbar, Ybar, Zbar. */
@@ -827,8 +832,11 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
     }
 
     /* Turn the parameter counts into probabilities via priors. */
-    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-        counts.data(), probsNew.data());
+    if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+        counts.data(), probsNew.data())) {
+      std::cerr << "Failed to convert counts to probabilities\n";
+      return false; // failure
+    }
 
     /* Determine termination condition.
        Then overwrite the old probabilities with the new ones. */
@@ -846,6 +854,8 @@ void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
             << ", iterations: " << num_iterations << ", "
             << (termCond ? "Baum-Welch converged" : "Baum-Welch not converged")
             << "\n";
+  
+  return true; // success
 
 }
 
@@ -1163,8 +1173,11 @@ Prior probability options:\n\
     }
 
     if (!countOnly) {
-      baumWelch(counts, ma, alphabetSize, dmix, gp,
-          profileLength, weights.data(), bwMaxiter, bwMaxDiff);
+      if (!baumWelch(counts, ma, alphabetSize, dmix, gp,
+          profileLength, weights.data(), bwMaxiter, bwMaxDiff)) {
+        std::cerr << "Failed to run Baum-Welch\n";
+        continue;
+      }
     }
 
     if (isCounts) {
@@ -1181,6 +1194,12 @@ Prior probability options:\n\
     double neff = entropyWeight(dmix, gp, alphabetSize,
 				weightSum, targetRelEnt,
 				profileLength, counts.data(), probs.data());
+    
+    if (neff == -1) {
+      std::cerr << "Failed to find a weight for the target relative entropy: "
+    << targetRelEnt << "\n";
+      continue;
+    }
 
     printProfile(probs.data(), columns.data(), alphabet, profileLength,
 		 argv, ma, neff, isCounts);

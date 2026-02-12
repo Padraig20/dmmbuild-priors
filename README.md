@@ -4,6 +4,9 @@ This repository takes (almost all) code from
 [DUMMER](https://gitlab.com/mcfrith/seq-position-probs),
 for which we try to estimate good pseudocounts. See below...
 
+Also: Remember to clone and build [Easel](https://github.com/EddyRivasLab/easel),
+which we need to get the Dirichlet MLEs.
+
 # DUMMER
 
 DUMMER (Dumb Uncomplicated Match ModelER) aims to find distant

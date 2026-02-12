@@ -1,5 +1,4 @@
 import os
-import dirichlet
 import numpy as np
 import subprocess
 import tempfile
@@ -18,7 +17,7 @@ class GapPriors:
         self.delEnd    = delEnd
         self.delExtend = delExtend
 
-def get_hmm_data(msa: str, method: str, use_counts_only: bool) -> list[list[float]]:
+def get_hmm_data(msa: str, use_counts_only: bool) -> list[list[float]]:
     # write HMM to a temporary file using the priors passed in
     out_hmm = tempfile.NamedTemporaryFile(delete=False, suffix=".hmm")
     out_hmm.close()
@@ -27,15 +26,13 @@ def get_hmm_data(msa: str, method: str, use_counts_only: bool) -> list[list[floa
         "./bin/dummer-build",
         "--maxiter", "100",
         "--pnone",
+        "--counts",
         msa
     ]
-    
-    if method == "easel":
-        cmd.insert(1, "--counts")
-    
+        
     if use_counts_only:
         cmd.insert(1, "--countonly")
-          # end of one HMM; keep going to read the ne
+
     try:
         # run the external build and write its stdout into the temporary HMM file
         with open(out_hmm.name, "w") as fh_out:
@@ -59,11 +56,8 @@ def get_hmm_data(msa: str, method: str, use_counts_only: bool) -> list[list[floa
             except ValueError:
                 # skip non-numeric lines
                 continue
-            # file stores negative log-probabilities => convert to normal probs
-            if method == "dirichlet":
-                p = np.exp(-vals)
-            else:  # method == "easel"
-                p = np.array([vals[0], vals[3], vals[2], vals[3], vals[4], vals[5], vals[6]])
+            
+            p = np.array([vals[0], vals[3], vals[2], vals[3], vals[4], vals[5], vals[6]])
             probs.append(p.tolist())
 
     # clean up temporary HMM file
@@ -77,29 +71,6 @@ def get_hmm_data(msa: str, method: str, use_counts_only: bool) -> list[list[floa
     return probs
 
 def get_new_gap_priors(probs: list[list[float]]) -> GapPriors:
-
-    a_d_g = np.array([prob[0:3] for prob in probs])
-    b_bp  = np.array([prob[3:5] for prob in probs])
-    e_ep  = np.array([prob[5:7] for prob in probs])
-    
-    try:
-        a = dirichlet.mle(a_d_g)
-        b = dirichlet.mle(b_bp)
-        e = dirichlet.mle(e_ep)
-    except Exception as ex:
-        print("-"*100)
-        print(f"Exception during Dirichlet MLE: {ex}")
-        print(f"No idea what happened. Terminating...")
-        print("-"*100)
-        exit(1)
-    
-    return GapPriors(
-        match=a[0], insStart=a[1], delStart=a[2],
-        insEnd=b[0], insExtend=b[1],
-        delEnd=e[0], delExtend=e[1]
-    )
-
-def get_new_gap_priors_easel(probs: list[list[float]]) -> GapPriors:
 
     # write probs to temporary CSV files
     tmp_m = tempfile.NamedTemporaryFile(delete=False, suffix="_m.csv")
@@ -176,20 +147,16 @@ def print_gap_priors(gp: GapPriors):
     print(f" delExtend: {gp.delExtend:.6f}")
 
 if __name__ == "__main__":
-    msa = "../Pfam-A.filtered_lt50.stk"
+    msa = "./9/Rfam.seed"
     print(f"Looking at file: {msa}")
-
-    # set this to "dirichlet" to use Dirichlet MLE
-    # set this to "easel" to use Easel's built-in method
-    method = "easel"
 
     # set this to true to run without Baum-Welch
     counts_only = False
 
     # set to true if mean counts should be displayed
-    verbose = False
+    verbose = True
                 
-    probs = get_hmm_data(msa, method, counts_only)
+    probs = get_hmm_data(msa, counts_only)
 
     if verbose:
         # compute and print mean of each of the 7 probability columns
@@ -203,12 +170,7 @@ if __name__ == "__main__":
             print("\n".join(f"{n}: {v:.6f}" for n, v in zip(names, mean_probs)))
             print()
 
-    if method == "dirichlet":
-        gp = get_new_gap_priors(probs)
-    elif method == "easel":
-        gp = get_new_gap_priors_easel(probs)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    gp = get_new_gap_priors(probs)
     
     print()
     print("="*100)
