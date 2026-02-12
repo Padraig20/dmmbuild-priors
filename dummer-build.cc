@@ -23,10 +23,6 @@
 
 #include <getopt.h>
 
-#include <climits>
-
-#define INF INT_MAX
-
 // Copied from HMMER 3.4:
 #define OPT_symfrac 0.50
 #define OPT_ere_aa  0.59
@@ -52,8 +48,13 @@ struct MultipleAlignment {
   int sequenceCount;
   int alignmentLength;
   std::vector<unsigned char> alignment;
+  std::vector<char> rf;
   std::string name;
 };
+
+bool isGap(char c) {
+  return c == '.' || c == '-' || c == '_' || c == '~';
+}
 
 void setCharToNumber(unsigned char *charToNumber, const char *alphabet) {
   for (int i = 0; alphabet[i]; ++i) {
@@ -62,16 +63,16 @@ void setCharToNumber(unsigned char *charToNumber, const char *alphabet) {
   }
 }
 
-bool normalize(double *x, int n) {
+void normalize(double *x, int n) {
   double s = std::accumulate(x, x + n, 0.0);
-  if (s <= 0.0) return false;
+  assert(s > 0);
   for (int i = 0; i < n; ++i) x[i] /= s;
-  return true;
 }
 
 // some MSAs (if --pnone is used) may have zero probabilities
 // log(0)/log(NaN) would produce errors
 double geometricMean(const double *values, int length, int step) {
+  assert(length > 0);
   const double minProb = 1e-6;
   double s = 0.0;
   for (int i = 0; i < length; ++i) {
@@ -83,12 +84,12 @@ double geometricMean(const double *values, int length, int step) {
   return exp(s / length);
 }
 
-bool setBackgroundProbs(double *bgProbs, const double *probs,
+void setBackgroundProbs(double *bgProbs, const double *probs,
 			int alphabetSize, int profileLength) {
   for (int i = 0; i < alphabetSize; ++i) {
     bgProbs[i] = geometricMean(probs + i, profileLength, 7 + alphabetSize);
   }
-  return normalize(bgProbs, alphabetSize);
+  normalize(bgProbs, alphabetSize);
 }
 
 // Probabilities are estimated from counts and a prior probability
@@ -113,7 +114,7 @@ double getProb(double count1, double count2,
   return (count1 * r + pseudocount1) / (s * r + (pseudocount1 + pseudocount2));
 }
 
-bool applyDirichletMixture(DirichletMixture dmix,
+void applyDirichletMixture(DirichletMixture dmix,
 			   int alphabetSize, double maxCountSum,
 			   const double *counts, double *probEstimate) {
   int componentSize = 1 + alphabetSize;  // 1 mixture coefficient + alphas
@@ -143,10 +144,10 @@ bool applyDirichletMixture(DirichletMixture dmix,
     }
   }
 
-  return normalize(probEstimate, alphabetSize);
+  normalize(probEstimate, alphabetSize);
 }
 
-bool gapCountsToProbs(const GapPriors &gp, double maxCountSum,
+void gapCountsToProbs(const GapPriors &gp, double maxCountSum,
 		      const double *counts, double *probs) {
   double match  = counts[0]; //gamma
   double notIns = counts[1]; //gamma + delta + tau = etap + oldGamma + epsilonp
@@ -158,7 +159,7 @@ bool gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   double delExt = counts[6]; //epsilon
 
   double gpNotIns = gp.match + gp.delStart;
-  if (notIns <= 0) return false;
+  assert(notIns > 0);
   double a = getProb(insBeg, notIns, gp.insStart, gpNotIns, maxCountSum);
   double d = getProb(delBeg, match, gp.delStart, gp.match, maxCountSum);
   probs[1] = a;  // insertion start probability
@@ -172,25 +173,22 @@ bool gapCountsToProbs(const GapPriors &gp, double maxCountSum,
   double e = getProb(delExt, delEnd, gp.delExtend, gp.delEnd, maxCountSum);
   probs[5] = 1 - e;
   probs[6] = e;  // deletion extend probability
-  return true;
 }
 
-bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
+void countsToProbs(DirichletMixture dmix, const GapPriors &gp,
 		   int alphabetSize, double maxCountSum,
 		   int profileLength, const double *counts, double *probs) {
   int countsPerPosition = 7 + alphabetSize;
-
-  bool success = true;
 
   for (int i = 0; ; ++i) {
     const double *c = counts + i * countsPerPosition;
     /* */ double *p = probs  + i * countsPerPosition;
 
-    success &= gapCountsToProbs(gp, maxCountSum, c, p);
+    gapCountsToProbs(gp, maxCountSum, c, p);
 
     if (i == profileLength) break;
 
-    success &= applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7);
+    applyDirichletMixture(dmix, alphabetSize, maxCountSum, c + 7, p + 7);
   }
 
   // These gap probabilities are never used - set them similarly to HMMER:
@@ -202,9 +200,7 @@ bool countsToProbs(DirichletMixture dmix, const GapPriors &gp,
   p[0] = 1 - p[1];  // match
   p[2] = 0;         // delStart
 
-  success &= setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
-
-  return success;
+  setBackgroundProbs(p + 7, probs + 7, alphabetSize, profileLength);
 }
 
 double relativeEntropy(const double *probs,
@@ -220,6 +216,33 @@ double relativeEntropy(const double *probs,
     probs += probsPerPosition;
   }
   return r;
+}
+
+double entropyWeight(DirichletMixture dmix, const GapPriors &gp,
+		     int alphabetSize, double rangeEnd, double targetRelEnt,
+		     int profileLength, const double *counts, double *probs) {
+  double rangeBeg = 0;
+  double rangeLen = rangeEnd;
+  double maxCountSum = 1e37;  // start with no limit on total weight
+
+  while (1) {
+    countsToProbs(dmix, gp, alphabetSize, maxCountSum, profileLength,
+		  counts, probs);
+    if (verbosity > 1) {
+      const double *bgProbs = probs + profileLength * (7 + alphabetSize) + 7;
+      std::cerr << "Background letter probabilities:" << std::setprecision(3);
+      for (int i = 0; i < alphabetSize; ++i) std::cerr << " " << bgProbs[i];
+      std::cerr << std::setprecision(6) << "\n";
+    }
+    double r = relativeEntropy(probs + 7, alphabetSize, profileLength);
+    if (verbosity) std::cerr << "Max total weight: " << maxCountSum
+			     << "  Relative entropy: " << r << "\n";
+    if (maxCountSum >= rangeEnd && r <= targetRelEnt) return rangeEnd;
+    if (rangeLen < 0.01) return maxCountSum;
+    if (r < targetRelEnt) rangeBeg = maxCountSum;
+    rangeLen /= 2;
+    maxCountSum = rangeBeg + rangeLen;
+  }
 }
 
 std::istream &readGapPriors(std::istream &in, GapPriors &gp) {
@@ -251,6 +274,8 @@ std::istream &readDirichletMixture(std::istream &in, DirichletMixture &dmix,
 }
 
 std::istream &checkAlignmentBlock(std::istream &in, MultipleAlignment &ma,
+				  const std::vector<std::string> &lines,
+				  const std::vector<std::string> &refLines,
 				  int lineCount) {
   if (lineCount) {
     if (ma.sequenceCount && lineCount != ma.sequenceCount) {
@@ -258,11 +283,21 @@ std::istream &checkAlignmentBlock(std::istream &in, MultipleAlignment &ma,
     }
     ma.sequenceCount = lineCount;
   }
+
+  if (!refLines.empty()) {
+    size_t blockCount = ma.sequenceCount ? lines.size() / ma.sequenceCount : 0;
+    if (refLines.size() != blockCount) fail(in, "bad RF lines");
+    if (refLines.back().size() != lines.back().size()) {
+      return fail(in, "RF length != aligned sequence length");
+    }
+  }
+
   return in;
 }
 
 std::istream &readMultipleAlignment(std::istream &in, MultipleAlignment &ma) {
   std::vector<std::string> lines;
+  std::vector<std::string> refLines;
   std::string line, word;
   int lineCount = 0;
   ma.sequenceCount = 0;
@@ -273,7 +308,7 @@ std::istream &readMultipleAlignment(std::istream &in, MultipleAlignment &ma) {
     std::istringstream iss(line);
     iss >> word;
     if (!iss) {
-      if (!checkAlignmentBlock(in, ma, lineCount)) return in;
+      if (!checkAlignmentBlock(in, ma, lines, refLines, lineCount)) return in;
       lineCount = 0;
     } else if (word == "#=GF") {
       iss >> word;
@@ -282,6 +317,13 @@ std::istream &readMultipleAlignment(std::istream &in, MultipleAlignment &ma) {
       }
     } else if (word == "//") {
       break;
+    } else if (word == "#=GC") {
+      iss >> word;
+      if (word != "RF") continue;
+      iss >> word;
+      if (!iss) return fail(in, "bad RF line");
+      if (ma.sequenceCount && refLines.empty()) fail(in, "bad RF lines");
+      refLines.push_back(word);
     } else if (word[0] != '#') {
       iss >> word;
       if (!iss) return fail(in, "bad alignment file");
@@ -297,7 +339,7 @@ std::istream &readMultipleAlignment(std::istream &in, MultipleAlignment &ma) {
     }
   }
 
-  if (!checkAlignmentBlock(in, ma, lineCount)) return in;
+  if (!checkAlignmentBlock(in, ma, lines, refLines, lineCount)) return in;
 
   ma.alignment.resize(ma.sequenceCount * ma.alignmentLength);
   unsigned char *a = ma.alignment.data();
@@ -308,6 +350,15 @@ std::istream &readMultipleAlignment(std::istream &in, MultipleAlignment &ma) {
 	unsigned char c = lines[i + j][k];
 	*a++ = c;
       }
+    }
+  }
+
+  ma.rf.resize(refLines.empty() ? 0 : ma.alignmentLength);
+  char *rf = ma.rf.data();
+
+  for (size_t j = 0; j < refLines.size(); ++j) {
+    for (size_t k = 0; k < refLines[j].size(); ++k) {
+      *rf++ = refLines[j][k];
     }
   }
 
@@ -335,7 +386,7 @@ bool isProteinAlignment(const MultipleAlignment &ma) {
   if (verbosity) std::cerr << "Nucleotide-like letters: " << dna << "\n"
 			   << "Total letters: " << tot << "\n";
 
-  return 1.0 * dna / tot < 0.9;  // xxx ???
+  return dna < 0.9 * tot;  // xxx ???
 }
 
 void markEndGaps(MultipleAlignment &ma, int alphabetSize) {
@@ -354,7 +405,7 @@ void markEndGaps(MultipleAlignment &ma, int alphabetSize) {
 }
 
 void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
-			 double symfrac, double *weights) {
+			 bool isHand, double symfrac, double *weights) {
   const int midGap = alphabetSize + 1;
   const int endGap = alphabetSize + 2;
   std::vector<int> positionCounts(ma.sequenceCount);
@@ -368,7 +419,7 @@ void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
     int totalCount = ma.sequenceCount - counts[endGap];
     int nonGapCount = totalCount - counts[midGap];
 
-    if (nonGapCount > 0 && nonGapCount >= symfrac * totalCount) {
+    if (isHand ? !isGap(ma.rf[i]) : (nonGapCount >= symfrac * totalCount)) {
       int types = 0;
       for (int k = 0; k < alphabetSize; ++k) {
 	types += (counts[k] > 0);
@@ -387,13 +438,15 @@ void makeSequenceWeights(const MultipleAlignment &ma, int alphabetSize,
     if (positionCounts[j]) weights[j] /= positionCounts[j];
   }
 
+  if (ma.sequenceCount == 0) return;
   double maxWeight = *std::max_element(weights, weights + ma.sequenceCount);
   if (maxWeight) {
     for (int j = 0; j < ma.sequenceCount; ++j) weights[j] /= maxWeight;
   }
 }
 
-void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
+void countEvents(const MultipleAlignment &ma, int alphabetSize,
+		 bool isHand, double symfrac,
 		 const double *weights, double weightSum, const GapPriors &gp,
 		 std::vector<double> &allCounts, std::vector<int> &columns) {
   const int midGap = alphabetSize + 1;
@@ -413,7 +466,8 @@ void countEvents(const MultipleAlignment &ma, int alphabetSize, double symfrac,
     double totalCount = weightSum - counts[endGap];
     double nonGapCount = totalCount - counts[midGap];
 
-    if (nonGapCount > 0 && nonGapCount >= symfrac * totalCount) {
+    if (isHand ? !isGap(ma.rf[i])
+	:        (nonGapCount > 0 && nonGapCount >= symfrac * totalCount)) {
       columns.push_back(i);
       double delBeg = 0;
       double delExt = 0;
@@ -506,12 +560,23 @@ void getSequenceWithoutGaps(
   seqNoGap.push_back(0);  // so it's safe to read one letter past the end
 }
 
-void forward(
+void calcLetterProbRatios(double *out, int alphabetSize, double gammaProb,
+			  const double *fgProbs, const double *bgProbs) {
+  for (int k = 0; k < alphabetSize; ++k) {
+    out[k] = gammaProb * fgProbs[k] / bgProbs[k];
+    assert(isfinite(out[k]));
+  }
+  out[alphabetSize] = gammaProb;
+}
+
+double forward(
      unsigned char *seq, int seqLength, std::vector<double> &probs,
-     int profileLength, int width, double *wSum,
+     int profileLength, int width,
      std::vector<double> &X, std::vector<double> &Y, std::vector<double> &Z) {
 
+  double wSum = 0;
   int cols = seqLength + 2;
+  const double *backgroundLetterProbs = &probs[profileLength * width + 7];
   double aPrime, bPrime, dPrime, ePrime;  // parameters for BW
   double alphaProb, betaProb, deltaProb, epsilonProb, epsilonProb1;
 
@@ -530,34 +595,36 @@ void forward(
     aPrime = alphaProb * (1.0 - betaProb);
     bPrime = betaProb;
 
+    double eProb = std::max(1 - epsilonProb, scale);
+    double eProb1 = std::max(1 - epsilonProb1, scale);
+
     // can use arbitrary values for S_m, d_m, e_m
-    dPrime = deltaProb   * (1 - epsilonProb1);
-    ePrime = epsilonProb * (1 - epsilonProb1) / (1 - epsilonProb);
-    if (!isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
+    dPrime = deltaProb   * eProb1;
+    ePrime = epsilonProb * eProb1 / eProb;
+    assert(isfinite(ePrime));
+
+    double letterParams[32];  // letter probs / background probs
+    calcLetterProbRatios(letterParams, width - 7, 1 - alphaProb - deltaProb,
+			 &probs[(i-1) * width + 7], backgroundLetterProbs);
 
     X[(i-1) * cols] = 0.0;
     double z = Z[i * cols] = 0.0;
 
     for (int j = 1; j <= seqLength+1; j++) {
-
       int letter = seq[j-1];
-
-      // letter probs / background probs
-      double S = (1 - alphaProb - deltaProb)
-               * probs[(i-1) * width + (7 + letter)]
-               / probs[profileLength * width + (7 + letter)];
-      if (!isfinite(S)) S = 0.0; // if letter has 0 background probability
-
+      double S = letterParams[letter];
       double y = Y[(i-1) * cols + j];
       double w = X[(i-1) * cols + (j-1)] + y + z + scale;
       z = aPrime * w + bPrime * z;
-      *wSum += w;
+      wSum += w;
 
       X[i * cols + j] = S * w;
       Y[i * cols + j] = dPrime * w + ePrime * y;
       Z[i * cols + j] = z;
     }
   }
+
+  return wSum;
 }
 
 void backward(unsigned char *seq, int seqLength,
@@ -565,6 +632,7 @@ void backward(unsigned char *seq, int seqLength,
      std::vector<double> &Wbar, std::vector<double> &Ybar, std::vector<double> &Zbar) {
 
   int cols = seqLength + 2;
+  const double *backgroundLetterProbs = &probs[profileLength * width + 7];
   double aPrime, bPrime, dPrime, ePrime;  // parameters for BW
   double alphaProb, betaProb, deltaProb, epsilonProb, epsilonProb1;
 
@@ -583,24 +651,24 @@ void backward(unsigned char *seq, int seqLength,
     aPrime = alphaProb * (1.0 - betaProb);
     bPrime = betaProb;
 
+    double eProb = std::max(1 - epsilonProb, scale);
+    double eProb1 = std::max(1 - epsilonProb1, scale);
+
     // can use arbitrary values for S_m, d_m, e_m
-    dPrime = deltaProb   * (1 - epsilonProb1);
-    ePrime = epsilonProb * (1 - epsilonProb1) / (1 - epsilonProb);
-    if (!isfinite(ePrime)) ePrime = 0.0; // avoid NaN issues
+    dPrime = deltaProb   * eProb1;
+    ePrime = epsilonProb * eProb1 / eProb;
+    assert(isfinite(ePrime));
+
+    double letterParams[32];  // letter probs / background probs
+    calcLetterProbRatios(letterParams, width - 7, 1 - alphaProb - deltaProb,
+			 &probs[i * width + 7], backgroundLetterProbs);
 
     Wbar[(i+2) * cols - 1] = 0.0;
     double z = Zbar[(i+1) * cols - 1] = 0.0;
 
     for (int j = seqLength; j >= 0; j--) {
-
       int letter = seq[j];
-
-      // letter probs / background probs
-      double S = (1 - alphaProb - deltaProb)
-               * probs[i * width + (7 + letter)]
-               / probs[profileLength * width + (7 + letter)];
-      if (!isfinite(S)) S = 0.0; // if letter has 0 background probability
-
+      double S = letterParams[letter];
       double x = S * Wbar[(i+1) * cols + (j+1)];
       double y = Ybar[(i+1) * cols + j];
       double w = x + dPrime * y + aPrime * z + scale;
@@ -693,7 +761,7 @@ int determineTerminationCondition(double bwMaxDiff,
   return (maxDiff <= bwMaxDiff) ? 1 : 0; // converged or not
 }
 
-bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
+void baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
      int alphabetSize, DirichletMixture dmix, const GapPriors &gp,
      int profileLength, const double *weights,
      double maxIter, double bwMaxDiff) {
@@ -718,10 +786,8 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
   std::vector<int>  seqsLengths(ma.sequenceCount, 0);
   getSequenceWithoutGaps(ma, alphabetSize, seqsNoGap, seqsLengths);
 
-  if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-      counts.data(), probsOld.data())) {
-    return false;
-  }
+  countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+      counts.data(), probsOld.data());
 
   int termCond;
   int num_iterations = 0;
@@ -738,14 +804,13 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
       /* Forward pass, calculate X, Y, Z and
          the aggregated v (i.e. sum of w-values). */
-      double v = 0.0; // accumulate the sum of weights
-      forward(seqNoGap, seqLength, probsOld,
-        profileLength, width, &v, X, Y, Z);
+      double v = forward(seqNoGap, seqLength, probsOld,
+        profileLength, width, X, Y, Z);
 
       if (!isfinite(v)) {
 	std::cerr
 	  << "numbers overflowed to infinity in Baum-Welch: quitting\n";
-	return false;
+	exit(1);
       }
 
       /* Backward pass, calculate Wbar, Ybar, Zbar. */
@@ -762,10 +827,8 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
     }
 
     /* Turn the parameter counts into probabilities via priors. */
-    if (!countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
-        counts.data(), probsNew.data())) {
-      return false;
-    }
+    countsToProbs(dmix, gp, alphabetSize, 1e37, profileLength,
+        counts.data(), probsNew.data());
 
     /* Determine termination condition.
        Then overwrite the old probabilities with the new ones. */
@@ -773,7 +836,8 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
 
     std::copy(probsNew.begin(), probsNew.end(), probsOld.begin());
 
-    std::cerr << "\rIteration " << ++num_iterations << " / " << maxIter << ": "
+    ++num_iterations;
+    std::cerr << "\rIteration " << num_iterations << " / " << maxIter << ": "
               << (termCond ? "    converged" : "not converged");
 
   } while (!termCond && num_iterations < maxIter);
@@ -783,7 +847,22 @@ bool baumWelch(std::vector<double> &counts, const MultipleAlignment &ma,
             << (termCond ? "Baum-Welch converged" : "Baum-Welch not converged")
             << "\n";
 
-  return false;
+}
+
+// Essentially taken from HMMER; the most likely (highest emmission
+// probability) residue is the consensus at each position.
+// If the emission probability is >= a certain threshold,
+// the residue is upper cased. The threshold is arbitrarily set
+// to 0.9 for nucleic acid alphabets and 0.5 for amino acid alphabets.
+// If we have counts instead of probabilities, we compute frequencies.
+// Assert: $i \in [0,profileLength)$
+char getConsensusAt(const double *probs,
+		    int alphabetSize, const char *alphabet) {
+  double mthresh = (alphabetSize > 4) ? 0.5 : 0.9;
+  int idx      = std::max_element(probs, probs + alphabetSize) - probs;
+  double sum   = std::accumulate(probs, probs + alphabetSize, 0.0);
+  char c = alphabet[idx];
+  return (probs[idx] >= mthresh * sum) ? toupper(c) : tolower(c);
 }
 
 void printProb(bool isCount, double prob) {
@@ -797,7 +876,7 @@ void printProb(bool isCount, double prob) {
 }
 
 void printProfile(const double *probs, const int *columns,
-		  const char *alphabet, int profileLength,
+		  const char *alphabet, int profileLength, char *argv[],
 		  const MultipleAlignment &ma, double neff, bool isCounts) {
   int alphabetSize = strlen(alphabet);
   int width = alphabetSize + 7;
@@ -809,9 +888,14 @@ void printProfile(const double *probs, const int *columns,
   std::cout << "NAME  " << ma.name << "\n";
   std::cout << "LENG  " << profileLength << "\n";
   std::cout << "ALPH  " << (alphabetSize > 4 ? "amino" : "DNA") << "\n";
+  std::cout << "RF    " << (ma.rf.empty() ? "no" : "yes") << "\n";
+  std::cout << "CONS  yes\n";
   std::cout << "MAP   yes\n";
   std::cout << "NSEQ  " << ma.sequenceCount << "\n";
   std::cout << "EFFN  " << neff << "\n";
+  std::cout << "BM   ";
+  for (char **p = argv; p[1]; ++p) std::cout << " " << *p;
+  std::cout << "\n";
 
   std::cout << "HMM     ";
   for (int i = 0; alphabet[i]; ++i) {
@@ -836,7 +920,9 @@ void printProfile(const double *probs, const int *columns,
     if (i == profileLength) break;
     std::cout << std::setw(7) << i+1 << " ";
     for (int j = 0; j < alphabetSize; ++j) printProb(isCounts, p[7 + j]);
-    std::cout << std::setw(7) << columns[i]+1 << "\n";
+    std::cout << std::setw(7) << columns[i]+1 << " "
+	      << getConsensusAt(p + 7, alphabetSize, alphabet) << " "
+	      << (ma.rf.empty() ? '-' : ma.rf[columns[i]]) << " - -\n";
   }
   std::cout.precision(6);
 
@@ -844,6 +930,7 @@ void printProfile(const double *probs, const int *columns,
 }
 
 int main(int argc, char* argv[]) {
+  bool isHand = false;
   bool isCounts = false;
   double symfrac = OPT_symfrac;
   double ere     = 0;
@@ -867,10 +954,13 @@ Options:\n\
   -h, --help     show this help message and exit\n\
   -V, --version  show version and exit\n\
   -v, --verbose  show progress messages\n\
+  --counts       output weighted counts instead of -log probs (implies --enone)\n\
+\n\
+Options for defining non-insert positions:\n\
+  --hand         use alignment RF column annotation lines (ignore symfrac)\n\
   --symfrac F    minimum (weighted) non-gap fraction to define a non-insert\n\
                      position (default: "
     STR(OPT_symfrac) ")\n\
-  --counts       output weighted counts instead of -log probs (implies --enone)\n\
 \n\
 Options for effective sequence number:\n\
   --enone        ignore relative entropy: set maximum sequence weight to 1\n\
@@ -902,6 +992,7 @@ Prior probability options:\n\
     {"verbose",   no_argument,       0, 'v'},
     {"symfrac",   required_argument, 0, 's'},
     {"counts",    no_argument,       0, 'C'},
+    {"hand",      no_argument,       0, 'H'},
     {"enone",     no_argument,       0, 'n'},
     {"ere",       required_argument, 0, 'p'},
     {"esigma",    required_argument, 0, 'e'},
@@ -934,6 +1025,9 @@ Prior probability options:\n\
       break;
     case 'C':
       isCounts = true;
+      break;
+    case 'H':
+      isHand = true;
       break;
     case 'n':
       esigma = 1e37;
@@ -1004,6 +1098,9 @@ Prior probability options:\n\
   while (readMultipleAlignment(in, ma)) {
     std::cout << std::fixed;
     std::cerr << "MSA #" << ++msa_count << ": " << ma.name << std::endl;
+    if (isHand && ma.rf.empty()) {
+      return err("missing RF annotation line: needed for --hand");
+    }
     bool isProtein = isProteinAlignment(ma);
     const char *alphabet = isProtein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT";
     int alphabetSize = strlen(alphabet);
@@ -1013,13 +1110,12 @@ Prior probability options:\n\
     charToNumber['-'] = charToNumber['.']
       = charToNumber['_'] = charToNumber['~'] = alphabetSize + 1;
 
-    //double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
+    double myEre = (ere > 0) ? ere : isProtein ? OPT_ere_aa : OPT_ere_nt;
 
     if (dirichletMixtureFileName) {
       int dmixAlphabetSize = dmixParameters.size() / dmix.componentCount - 1;
       if (dmixAlphabetSize != alphabetSize) {
-	std::cerr << "the Dirichlet mixture file has wrong alphabet size\n";
-	return 1;
+	return err("the Dirichlet mixture file has wrong alphabet size");
       }
     } else if (pnone) {
       dmixParameters.resize(1 + alphabetSize);
@@ -1043,7 +1139,7 @@ Prior probability options:\n\
     markEndGaps(ma, alphabetSize);
 
     std::vector<double> weights(ma.sequenceCount);
-    makeSequenceWeights(ma, alphabetSize, symfrac, weights.data());
+    makeSequenceWeights(ma, alphabetSize, isHand, symfrac, weights.data());
     double weightSum = std::accumulate(weights.begin(), weights.end(), 0.0);
 
     if (verbosity > 1) {
@@ -1057,34 +1153,36 @@ Prior probability options:\n\
 
     std::vector<double> counts;
     std::vector<int> columns;
-    countEvents(ma, alphabetSize, symfrac, weights.data(), weightSum, gp,
-		counts, columns);
+    countEvents(ma, alphabetSize, isHand, symfrac, weights.data(), weightSum,
+		gp, counts, columns);
     int profileLength = columns.size();
 
+    if (profileLength == 0) {
+      std::cerr << "profile length 0: skipping\n";
+      continue;
+    }
+
     if (!countOnly) {
-      bool term = baumWelch(counts, ma, alphabetSize, dmix, gp,
+      baumWelch(counts, ma, alphabetSize, dmix, gp,
           profileLength, weights.data(), bwMaxiter, bwMaxDiff);
-      if (term) {
-        std::cerr << "Failed, quitting!" << std::endl;
-        continue;
-      }
     }
 
     if (isCounts) {
       printProfile(counts.data(), columns.data(), alphabet, profileLength,
-		   ma, weightSum, isCounts);
+		   argv, ma, weightSum, isCounts);
       continue;
     }
 
     std::vector<double> probs(counts.size());
 
-    if (!countsToProbs(dmix, gp, alphabetSize, INF, profileLength,
-        counts.data(), probs.data())) {
-      std::cerr << "Failed, quitting!" << std::endl;
-      continue;
-    }
+    double targetRelEnt = std::max(esigma, myEre * profileLength);
+    if (verbosity) std::cerr << "Target relative entropy: "
+			     << targetRelEnt << "\n";
+    double neff = entropyWeight(dmix, gp, alphabetSize,
+				weightSum, targetRelEnt,
+				profileLength, counts.data(), probs.data());
 
     printProfile(probs.data(), columns.data(), alphabet, profileLength,
-		 ma, INF, isCounts);
+		 argv, ma, neff, isCounts);
   }
 }

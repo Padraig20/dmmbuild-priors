@@ -2,11 +2,11 @@ CXXFLAGS = -Wall -O3 -g -march=native
 
 all: bin/dummer bin/dummerl bin/dummer-build
 
-bin/dummer: dummer.cc dummer-util.hh version.hh can_i_haz_simd.hh
+bin/dummer: dummer.cc dummer-util.hh tantan-wrapper.hh version.hh can_i_haz_simd.hh
 	mkdir -p bin
 	$(CXX) -DDOUBLE $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ dummer.cc
 
-bin/dummerl: dummer.cc dummer-util.hh version.hh can_i_haz_simd.hh
+bin/dummerl: dummer.cc dummer-util.hh tantan-wrapper.hh version.hh can_i_haz_simd.hh
 	mkdir -p bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ dummer.cc
 
@@ -18,7 +18,7 @@ clean:
 	rm -f bin/dummer*
 
 VERSION1 = git describe --dirty
-VERSION2 = echo '$Format:%d$ ' | sed -e 's/.*tag: *//' -e 's/[,) ].*//'
+VERSION2 = echo ' (HEAD -> main, tag: 1.10.1) ' | sed -e 's/.*tag: *//' -e 's/[,) ].*//'
 
 VERSION = \"`test -e .git && $(VERSION1) || $(VERSION2)`\"
 

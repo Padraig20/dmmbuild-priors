@@ -6,6 +6,7 @@
 // insertions, and deletions", MC Frith 2025
 
 #include "dummer-util.hh"
+#include "tantan-wrapper.hh"
 #include "can_i_haz_simd.hh"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include <assert.h>
 #include <ctype.h>
 #include <float.h>
 #include <limits.h>
@@ -26,6 +28,7 @@
 
 #define OPT_e 10.0
 #define OPT_s 2
+#define OPT_m 3
 #define OPT_t 1000
 #define OPT_l 500
 #define OPT_b 100
@@ -48,12 +51,6 @@ Float simdHorizontalMax(SimdFloat x) {  // assuming it doesn't need to be fast
   Float y[simdLen];
   simdStore(y, x);
   return *std::max_element(y, y + simdLen);
-}
-
-SimdFloat simdLookupTable(const Float *table) {  // assume 4 items in the table
-  Float s[simdLen];
-  for (int i = 0; i < simdLen; ++i) s[i] = table[i % 4];
-  return simdLoad(s);
 }
 
 SimdFloat simdPowersFwd(Float x) {
@@ -81,11 +78,15 @@ const int shift = 63;  // add this to scores, to undo the scaling
 
 int verbosity = 0;
 
+const int nonLetterWidth = 8;  // number of non-letter values per position
+
 struct Profile {  // position-specific (insert, delete, letter) probabilities
   Float *values;  // probabilities or probability ratios
-  int width;  // values per position: 4 + alphabetSize + 2
+  int width;   // number of values per position
   int length;  // number of positions
   size_t nameIdx;
+  size_t consensusSequenceIdx;
+  double gumbelKendAnchored, gumbelKbegAnchored, gumbelKmidAnchored;
 };
 
 struct Sequence {
@@ -93,17 +94,8 @@ struct Sequence {
   int length;
 };
 
-struct Contig {
-  int start;
-  int length;
-};
-
 struct SegmentPair {
   int start1, start2, length;
-};
-
-struct Triple {
-  double endAnchored, begAnchored, midAnchored;
 };
 
 struct InitialSimilarity {
@@ -116,6 +108,7 @@ struct AlignedSimilarity {
   int anchor1, anchor2;
   Float wEndAnchored;
   std::vector<SegmentPair> alignment;
+  std::vector<char> matchProbs;
 };
 
 struct FinalSimilarity {
@@ -136,6 +129,12 @@ int simEnd2(const AlignedSimilarity &x) {
     x.anchor2 : x.alignment.back().start2 + x.alignment.back().length;
 }
 
+const int sequenceWindowStep = 0x40000;  // long sequence: overlapping windows
+
+int sequenceWindowLength(int profileLength) {
+  return sequenceWindowStep + profileLength * 2;  // xxx enough overlap?
+}
+
 double mean(const double *x, int n) {
   double s = 0;
   for (int i = 0; i < n; ++i) s += x[i];
@@ -146,6 +145,11 @@ int numOfDigits(int x) {
   int n = 0;
   do ++n; while (x /= 10);
   return n;
+}
+
+const char *getAlphabet(int alphabetSize) {
+  return alphabetSize == 20 ? "ACDEFGHIKLMNPQRSTVWYUOX"
+    :    alphabetSize ==  4 ? "ACGTNNN" : 0;
 }
 
 char complement(char c) {
@@ -160,104 +164,107 @@ void reverseComplement(char *beg, char *end) {
   }
 }
 
-std::istream &readContig(std::istream &in, Sequence &sequence, Contig &contig,
-			 std::vector<char> &vec, const char *charToNumber) {
-  if (contig.length == 0) {
-    char x;
-    if (!(in >> x)) return in;
-    if (x != '>') return fail(in, "bad sequence data: no '>'");
-    std::string line, word;
-    getline(in, line);
-    std::istringstream iss(line);
-    if (!(iss >> word)) return fail(in, "bad sequence data: no name");
-    sequence.nameIdx = vec.size();
-    sequence.length = 0;
-    const char *name = word.c_str();
-    vec.insert(vec.end(), name, name + word.size() + 1);
-    if (verbosity > 0) std::cerr << "Sequence: " << name << "\n";
-  }
+std::istream &readSequence(std::istream &in, Sequence &sequence,
+			   std::vector<char> &vec, const char *charToNumber) {
+  char x;
+  if (!(in >> x)) return in;
+  if (x != '>') return fail(in, "bad sequence data: no '>'");
+  std::string line, word;
+  getline(in, line);
+  std::istringstream iss(line);
+  if (!(iss >> word)) return fail(in, "bad sequence data: no name");
+  sequence.nameIdx = vec.size();
+  const char *name = word.c_str();
+  vec.insert(vec.end(), name, name + word.size() + 1);
+  if (verbosity > 0) std::cerr << "Sequence: " << name << "\n";
 
   size_t seqIdx = vec.size();
   std::streambuf *buf = in.rdbuf();
   int c = buf->sgetc();
 
   while (c != std::streambuf::traits_type::eof() && c != '>') {
-    if (charToNumber[c] < 125) break;  // found a contig symbol
-    if (c > ' ') ++sequence.length;  // skip over non-contig symbols
-    c = buf->snextc();
-  }
-
-  while (c != std::streambuf::traits_type::eof() && charToNumber[c] < 126) {
     if (c > ' ') vec.push_back(charToNumber[c]);
     c = buf->snextc();
   }
 
   size_t seqLen = vec.size() - seqIdx;
-  if (seqLen > INT_MAX - 2 * simdLen) return fail(in, "sequence is too long!");
-  contig.start = sequence.length;
-  contig.length = seqLen;
-  sequence.length += seqLen;
+  if (seqLen > INT_MAX - simdLen) return fail(in, "sequence is too long!");
+  sequence.length = seqLen;
   return in;
 }
 
-int consensusLetter(Profile profile, int position) {
-  const Float *S = profile.values + position * profile.width + 4;
-  return std::max_element(S, S + profile.width - 6) - S;
+char profileLetter(const char *alphabet, char letterCode) {
+  return alphabet[letterCode & 31] + (letterCode & 32);  // upper/lowercase
 }
 
 void addAlignedProfile(std::vector<char> &gappedSeq,
 		       const std::vector<SegmentPair> &alignment,
-		       const char *alphabet, Profile profile) {
+		       const char *alphabet, const char *consensusSequence) {
   int pos1 = alignment[0].start1;
   int pos2 = alignment[0].start2;
   for (auto a : alignment) {
     for (; pos1 < a.start1; ++pos1) {
-      gappedSeq.push_back(alphabet[consensusLetter(profile, pos1)]);
+      gappedSeq.push_back(profileLetter(alphabet, consensusSequence[pos1]));
     }
     gappedSeq.insert(gappedSeq.end(), a.start2 - pos2, '-');
     for (; pos1 < a.start1 + a.length; ++pos1) {
-      gappedSeq.push_back(alphabet[consensusLetter(profile, pos1)]);
+      gappedSeq.push_back(profileLetter(alphabet, consensusSequence[pos1]));
     }
     pos2 = a.start2 + a.length;
   }
 }
 
+char seqLetter(const char *alphabet, const char *sequence,
+	       const char *maskedSequence, int position) {
+  char c = sequence[position];
+  return alphabet[c] + (maskedSequence[position] > c) * 32;  // upper/lowercase
+}
+
 void addAlignedSequence(std::vector<char> &gappedSeq,
 			const std::vector<SegmentPair> &alignment,
-			const char *alphabet, const char *sequence) {
+			const char *alphabet, const char *sequence,
+			const char *maskedSequence) {
   int pos1 = alignment[0].start1;
   int pos2 = alignment[0].start2;
   for (auto a : alignment) {
     gappedSeq.insert(gappedSeq.end(), a.start1 - pos1, '-');
     for (; pos2 < a.start2; ++pos2) {
-      gappedSeq.push_back(alphabet[sequence[pos2]]);
+      gappedSeq.push_back(seqLetter(alphabet, sequence, maskedSequence, pos2));
     }
     for (; pos2 < a.start2 + a.length; ++pos2) {
-      gappedSeq.push_back(alphabet[sequence[pos2]]);
+      gappedSeq.push_back(seqLetter(alphabet, sequence, maskedSequence, pos2));
     }
     pos1 = a.start1 + a.length;
   }
 }
 
-int strandPosition(size_t strandNum, int seqLength, int position) {
-  return (strandNum % 2) ? seqLength - position : position;
+void addAlignedProbs(std::vector<char> &gappedSeq,
+		     const std::vector<SegmentPair> &alignment,
+		     const char *matchProbs) {
+  int pos1 = alignment[0].start1;
+  int pos2 = alignment[0].start2;
+  for (auto a : alignment) {
+    gappedSeq.insert(gappedSeq.end(), a.start1 - pos1, '-');
+    gappedSeq.insert(gappedSeq.end(), a.start2 - pos2, '-');
+    for (int i = 0; i < a.length; ++i) gappedSeq.push_back(*matchProbs++);
+    pos1 = a.start1 + a.length;
+    pos2 = a.start2 + a.length;
+  }
 }
 
 void printSimilarity(const char *names, Profile p, Sequence s,
 		     const FinalSimilarity &sim, double evalue) {
   char strand = "+-"[sim.strandNum % 2];
   const char *seq = sim.alignedSequences.data();
-  int length = sim.alignedSequences.size() / 2;
+  int length = sim.alignedSequences.size() / 3;
   int span1 = length - std::count(seq, seq + length, '-');
   int span2 = length - std::count(seq + length, seq + length * 2, '-');
-  int start2 = strandPosition(sim.strandNum, s.length, sim.start2);
-  int anchor2 = strandPosition(sim.strandNum, s.length, sim.anchor2);
   int w1 = std::max(strlen(names + p.nameIdx), strlen(names + s.nameIdx));
-  int w2 = std::max(numOfDigits(sim.start1), numOfDigits(start2));
+  int w2 = std::max(numOfDigits(sim.start1), numOfDigits(sim.start2));
   int w3 = std::max(numOfDigits(span1), numOfDigits(span2));
   int w4 = std::max(numOfDigits(p.length), numOfDigits(s.length));
   std::cout << "a score=" << log2(sim.probRatio)+shift << " E=" << evalue
-	    << " anchor=" << sim.anchor1 << "," << anchor2 << "\n";
+	    << " anchor=" << sim.anchor1 << "," << sim.anchor2 << "\n";
   std::cout << "s " << std::left << std::setw(w1) << names + p.nameIdx << " "
 	    << std::right << std::setw(w2) << sim.start1 << " "
 	    << std::setw(w3) << span1 << " " << '+' << " "
@@ -265,44 +272,59 @@ void printSimilarity(const char *names, Profile p, Sequence s,
   std::cout.write(seq, length);
   std::cout << "\n";
   std::cout << "s " << std::left << std::setw(w1) << names + s.nameIdx << " "
-	    << std::right << std::setw(w2) << start2 << " "
+	    << std::right << std::setw(w2) << sim.start2 << " "
 	    << std::setw(w3) << span2 << " " << strand << " "
 	    << std::setw(w4) << s.length << " ";
   std::cout.write(seq + length, length);
+  std::cout << "\n";
+  std::cout << "P " << std::setw(w1 + w2 + w3 + w4 + 6) << "";
+  std::cout.write(seq + length * 2, length);
   std::cout << "\n\n";
 }
 
-void addForwardMatch(std::vector<SegmentPair> &alignment, int pos1, int pos2) {
+char probCode(double prob) {
+  int i = prob * 10 + 0.5;
+  return "0123456789*"[i];
+}
+
+bool addForwardMatch(std::vector<SegmentPair> &alignment, int pos1, int pos2) {
   if (!alignment.empty()) {
     SegmentPair &x = alignment.back();
     if (x.start1 + x.length == pos1 && x.start2 + x.length == pos2) {
       ++x.length;
+      return true;
     }
-    if (x.start1 + x.length > pos1 || x.start2 + x.length > pos2) return;
+    if (x.start1 + x.length > pos1 || x.start2 + x.length > pos2) return false;
   }
   SegmentPair sp = {pos1, pos2, 1};
   alignment.push_back(sp);
+  return true;
 }
 
-void addReverseMatch(std::vector<SegmentPair> &alignment, int pos1, int pos2) {
+bool addReverseMatch(std::vector<SegmentPair> &alignment, int pos1, int pos2) {
   if (!alignment.empty()) {
     SegmentPair &x = alignment.back();
     if (x.start1 - 1 == pos1 && x.start2 - 1 == pos2) {
       --x.start1;
       --x.start2;
       ++x.length;
+      return true;
     }
-    if (x.start1 <= pos1 || x.start2 <= pos2) return;
+    if (x.start1 <= pos1 || x.start2 <= pos2) return false;
   }
   SegmentPair sp = {pos1, pos2, 1};
   alignment.push_back(sp);
+  return true;
 }
 
-void addForwardAlignment(std::vector<SegmentPair> &alignment,
+void addForwardAlignment(AlignedSimilarity &sim,
 			 Profile profile, const char *sequence,
 			 int sequenceLength, const Float *scratch,
-			 int iBeg, int jBeg, double half) {
+			 double totProbRatio) {
+  const double lowProb = 0.5;
   long rowSize = simdRoundUp(sequenceLength + 1) + simdLen;
+  int iBeg = sim.anchor1;
+  int jBeg = sim.anchor2;
   const char *seq = sequence + jBeg;
 
   for (int size = 16; ; size *= 2) {
@@ -333,12 +355,16 @@ void addForwardAlignment(std::vector<SegmentPair> &alignment,
 	z = a * w + b * z;
 	if (i == profile.length || jBeg + j == sequenceLength) continue;
 	X[j] = S[seq[j]] * w;
-	if (X[j] * Wbackward[j] > half * scale) {
-	  addForwardMatch(alignment, i, jBeg + j);
+	double matchProbRatio = X[j] * Wbackward[j];
+	if (matchProbRatio > totProbRatio * lowProb * scale) {
+	  if (addForwardMatch(sim.alignment, i, jBeg + j)) {
+	    double matchProb = matchProbRatio / (totProbRatio * scale);
+	    sim.matchProbs.push_back(probCode(matchProb));
+	  }
 	}
       }
 
-      if (wSum >= half) return;
+      if (wSum >= totProbRatio * (1 - lowProb)) return;
     }
 
     // this line should be unnecessary, except for problems such as overflow:
@@ -346,11 +372,14 @@ void addForwardAlignment(std::vector<SegmentPair> &alignment,
   }
 }
 
-void addReverseAlignment(std::vector<SegmentPair> &alignment,
+void addReverseAlignment(AlignedSimilarity &sim,
 			 Profile profile, const char *sequence,
 			 int sequenceLength, const Float *scratch,
-			 int iEnd, int jEnd, double half) {
+			 double totProbRatio) {
+  const double lowProb = 0.5;
   long rowSize = simdRoundUp(sequenceLength + 1) + simdLen;
+  int iEnd = sim.anchor1;
+  int jEnd = sim.anchor2;
   const char *seq = sequence + jEnd;
 
   for (int size = 16; ; size *= 2) {
@@ -381,12 +410,16 @@ void addReverseAlignment(std::vector<SegmentPair> &alignment,
 	z = w + b * z;
 	if (i < 0 || jEnd + j < 0) continue;
 	X[j] = S[seq[j]] * w;
-	if (Xforward[j] * w > half * scale) {
-	  addReverseMatch(alignment, i, jEnd + j);
+	double matchProbRatio = Xforward[j] * w;
+	if (matchProbRatio > totProbRatio * lowProb * scale) {
+	  if (addReverseMatch(sim.alignment, i, jEnd + j)) {
+	    double matchProb = matchProbRatio / (totProbRatio * scale);
+	    sim.matchProbs.push_back(probCode(matchProb));
+	  }
 	}
       }
 
-      if (wSum >= half) return;
+      if (wSum >= totProbRatio * (1 - lowProb)) return;
     }
 
     // this line should be unnecessary, except for problems such as overflow:
@@ -476,8 +509,8 @@ void addMidAnchored(std::vector<AlignedSimilarity> &similarities,
   if (!maybeLocalMaximum(profile, sequence, sequenceLength, scratch,
 			 anchor1, anchor2, wMidAnchored)) return;
   AlignedSimilarity s = {wMidAnchored / scale, anchor1, anchor2, wEndAnchored};
-  addForwardAlignment(s.alignment, profile, sequence, sequenceLength,
-		      scratch, anchor1, anchor2, wBegAnchored / 2);
+  addForwardAlignment(s, profile, sequence, sequenceLength,
+		      scratch, wBegAnchored);
   similarities.push_back(s);
 }
 
@@ -485,9 +518,11 @@ void finishMidAnchored(AlignedSimilarity &s,
 		       Profile profile, const char *sequence,
 		       int sequenceLength, const Float *scratch) {
   reverse(s.alignment.begin(), s.alignment.end());
-  addReverseAlignment(s.alignment, profile, sequence, sequenceLength,
-		      scratch, s.anchor1, s.anchor2, s.wEndAnchored / 2);
+  reverse(s.matchProbs.begin(), s.matchProbs.end());
+  addReverseAlignment(s, profile, sequence, sequenceLength,
+		      scratch, s.wEndAnchored);
   reverse(s.alignment.begin(), s.alignment.end());
+  reverse(s.matchProbs.begin(), s.matchProbs.end());
 }
 
 bool isLess(const AlignedSimilarity &a, const AlignedSimilarity &b) {
@@ -506,15 +541,14 @@ bool isOverlapping(const std::vector<SegmentPair> &alignment1,
   return false;
 }
 
-void nonredundantize(std::vector<AlignedSimilarity> &similarities) {
-  sort(similarities.begin(), similarities.end(), isLess);
+void nonredundantize(std::vector<AlignedSimilarity> &sims, size_t start) {
+  sort(sims.begin() + start, sims.end(), isLess);
 
-  size_t k = 0;
-  for (size_t i = 0; i < similarities.size(); ++i) {
-    AlignedSimilarity &x = similarities[i];
+  for (size_t i = start; i < sims.size(); ++i) {
+    AlignedSimilarity &x = sims[i];
     int end = simEnd2(x);
-    for (size_t j = i + 1; j < similarities.size(); ++j) {
-      AlignedSimilarity &y = similarities[j];
+    for (size_t j = i + 1; j < sims.size(); ++j) {
+      AlignedSimilarity &y = sims[j];
       if (simBeg2(y) >= end) break;
       if (isOverlapping(x.alignment, y.alignment)) {
 	if (x.probRatio < y.probRatio) {
@@ -525,12 +559,12 @@ void nonredundantize(std::vector<AlignedSimilarity> &similarities) {
       }
     }
     if (x.probRatio > 0) {
-      std::swap(similarities[k], similarities[i]);
-      ++k;
+      std::swap(sims[start], sims[i]);
+      ++start;
     }
   }
 
-  similarities.resize(k);
+  sims.resize(start);
 }
 
 int updateInitialSimilarities(InitialSimilarity *sims, int count,
@@ -544,11 +578,11 @@ int updateInitialSimilarities(InitialSimilarity *sims, int count,
   return j + 1;
 }
 
-void findSimilarities(std::vector<AlignedSimilarity> &similarities,
+bool findSimilarities(std::vector<AlignedSimilarity> &similarities,
 		      Profile profile, const char *sequence,
 		      int sequenceLength, Float *scratch,
 		      Float minProbRatio) {
-  const int lookupType = (simdLen > 4 && profile.width <= 10) ? 1
+  const int lookupType = (simdLen > 4 && profile.width <= 12) ? 1
     :                    (simdLen > 8)                        ? 2 : 0;
   const Float zero = 0;
   SimdFloat simdScale = simdFill(scale);
@@ -589,12 +623,8 @@ void findSimilarities(std::vector<AlignedSimilarity> &similarities,
     const Float *Wfrom = (i < profile.length) ? W + rowSize + 1 : Y;
     const Float *params = profile.values + i * profile.width;
     const Float *S = params + 4;
-    if (lookupType == 1) {
-      S1 = simdLookupTable(S);
-    } else if (lookupType == 2) {
-      S1 = simdLoad(S);
-      S2 = simdLoad(S + simdLen);
-    }
+    if (lookupType > 0) S1 = simdLoad(S);
+    if (lookupType > 1) S2 = simdLoad(S + simdLen);
     SimdFloat a = simdFill(params[0]);  // insert open
     SimdFloat d = simdFill(params[2]);  // delete open
     SimdFloat e = simdFill(params[3]);  // delete extend
@@ -632,17 +662,14 @@ void findSimilarities(std::vector<AlignedSimilarity> &similarities,
     }
   }
 
-  if (wMax > DBL_MAX) {
-    std::cerr << "numbers overflowed to infinity: giving up this comparison\n";
-    return;
-  }
+  if (wMax > DBL_MAX) return false;
 
   const Float *maxRow = scratch + iMax * rowSize;
   jMax = std::find(maxRow, maxRow + seqEnd, wMax) - maxRow;
 
   AlignedSimilarity begAnchored = {wMax, iMax, jMax};
-  addForwardAlignment(begAnchored.alignment, profile, sequence,
-		      sequenceLength, scratch, iMax, jMax, wMax / 2);
+  addForwardAlignment(begAnchored, profile, sequence,
+		      sequenceLength, scratch, wMax);
 
   if (verbosity > 1 && minProbRatio >= -1)
     std::cerr << "Forward algorithm...\n";
@@ -658,28 +685,25 @@ void findSimilarities(std::vector<AlignedSimilarity> &similarities,
   // w       <-  u  +  a[i] Z[i,j-1]
   // Z[i,j]  <-  u  +  (a[i] + b[i]) Z[i,j-1]    (using SIMD "cumulation")
 
+  size_t oldSimCount = similarities.size();
   wMax = 0;
   Float wMidMax = 0;
-  Float wBegAnchored, wEndAnchored;
-  int iMidMax, jMidMax;
-  std::vector<SegmentPair> alignment;
+  AlignedSimilarity midAnchored;
   SimdFloat simdMinProbRatio = simdFill(minProbRatio);
 
   for (int j = 0; j < seqEnd; ++j) Y[j] = 0;
 
   for (int i = 0; i <= profile.length; ++i) {
+    Float wBegAnchored, wEndAnchored;
+    int jMidMax;
     Float wMidMaxHere = wMidMax;
     Float *X = scratch + i * rowSize;
     const Float *Xfrom = (i > 0) ? X - rowSize - 1 : Y;
     const Float *Wbackward = X;  // the forward Xs overwrite the backward Ws
     const Float *params = profile.values + i * profile.width;
     const Float *S = params + 4;
-    if (lookupType == 1) {
-      S1 = simdLookupTable(S);
-    } else if (lookupType == 2) {
-      S1 = simdLoad(S);
-      S2 = simdLoad(S + simdLen);
-    }
+    if (lookupType > 0) S1 = simdLoad(S);
+    if (lookupType > 1) S2 = simdLoad(S + simdLen);
     SimdFloat a = simdFill(params[0]);  // insert open
     SimdFloat d = simdFill(params[2]);  // delete open
     SimdFloat e = simdFill(params[3]);  // delete extend
@@ -754,11 +778,11 @@ void findSimilarities(std::vector<AlignedSimilarity> &similarities,
 
     if (wMidMaxHere > wMidMax) {
       wMidMax = wMidMaxHere;
-      iMidMax = i;
+      AlignedSimilarity as = {wMidMax / scale, i, jMidMax, wEndAnchored};
+      midAnchored = as;
       if (minProbRatio >= -1) {
-	alignment.clear();
-	addForwardAlignment(alignment, profile, sequence, sequenceLength,
-			    scratch, iMidMax, jMidMax, wBegAnchored / 2);
+	addForwardAlignment(midAnchored, profile, sequence, sequenceLength,
+			    scratch, wBegAnchored);
       }
     }
 
@@ -770,60 +794,83 @@ void findSimilarities(std::vector<AlignedSimilarity> &similarities,
 
   if (minProbRatio >= 0) {
     if (verbosity > 1) std::cerr << "Initial similarities: "
-				 << similarities.size() << "\n";
-    nonredundantize(similarities);
+				 << similarities.size() - oldSimCount << "\n";
+    nonredundantize(similarities, oldSimCount);
     if (verbosity > 1) std::cerr << "Non-overlapping forward extensions: "
-				 << similarities.size() << "\n";
-    for (auto &x : similarities) {
-      finishMidAnchored(x, profile, sequence, sequenceLength, scratch);
+				 << similarities.size() - oldSimCount << "\n";
+    for (size_t i = oldSimCount; i < similarities.size(); ++i) {
+      finishMidAnchored(similarities[i], profile, sequence, sequenceLength,
+			scratch);
     }
-    nonredundantize(similarities);
-    if (verbosity > 1) std::cerr << "Non-overlapping similarities: "
-				 << similarities.size() << "\n";
   } else {
-    AlignedSimilarity midAnchored = {wMidMax / scale, iMidMax, jMidMax,
-				     wEndAnchored, alignment};
     finishMidAnchored(midAnchored, profile, sequence, sequenceLength, scratch);
 
     AlignedSimilarity endAnchored = {wMax, iMax, jMax};
-    addReverseAlignment(endAnchored.alignment, profile, sequence,
-			sequenceLength, scratch, iMax, jMax, wMax / 2);
+    addReverseAlignment(endAnchored, profile, sequence,
+			sequenceLength, scratch, wMax);
     reverse(endAnchored.alignment.begin(), endAnchored.alignment.end());
+    reverse(endAnchored.matchProbs.begin(), endAnchored.matchProbs.end());
 
     similarities.push_back(endAnchored);
     similarities.push_back(begAnchored);
     similarities.push_back(midAnchored);
   }
+
+  return true;
 }
 
-int contigToSequencePos(Contig contig, size_t strandNum, int posInContig) {
-  return contig.start + strandPosition(strandNum, contig.length, posInContig);
-}
-
-void findFinalSimilarities(std::vector<FinalSimilarity> &similarities,
-			   Profile profile, const char *sequence,
-			   Contig contig, Float *scratch,
+bool findFinalSimilarities(std::vector<FinalSimilarity> &similarities,
+			   Profile profile, const char *charVec,
+			   size_t seqIdx, size_t maskedSeqIdx,
+			   int seqLength, Float *scratch,
 			   size_t profileNum, size_t strandNum,
 			   Float minProbRatio) {
-  const char *alphabet =
-    (profile.width == 10) ? "acgt" : "ACDEFGHIKLMNPQRSTVWYUO";
-
+  const char *alphabet = getAlphabet(profile.width - nonLetterWidth);
+  const char *profileSeq = charVec + profile.consensusSequenceIdx;
+  const char *sequence = charVec + seqIdx;
+  const char *maskedSequence = charVec + maskedSeqIdx;
   std::vector<AlignedSimilarity> sims;
-  findSimilarities(sims, profile, sequence, contig.length, scratch,
-		   minProbRatio);
+  size_t simCount = 0;
+
+  for (int beg = 0; ; beg += sequenceWindowStep) {
+    int len = std::min(sequenceWindowLength(profile.length), seqLength - beg);
+    if (!findSimilarities(sims, profile, maskedSequence + beg, len,
+			  scratch, minProbRatio)) return false;
+    while (simCount < sims.size()) {
+      sims[simCount].anchor2 += beg;
+      for (auto &y : sims[simCount].alignment) y.start2 += beg;
+      ++simCount;
+    }
+    if (beg + len == seqLength) break;
+  }
+
+  if (minProbRatio >= 0) {
+    nonredundantize(sims, 0);
+    if (verbosity > 1) std::cerr << "Non-overlapping similarities: "
+				 << sims.size() << "\n";
+  } else {
+    for (size_t i = 3; i < sims.size(); ++i) {
+      size_t j = i % 3;
+      if (sims[i].probRatio > sims[j].probRatio) std::swap(sims[i], sims[j]);
+    }
+    sims.resize(3);
+  }
 
   for (const auto &x : sims) {
-    int anchor2 = contigToSequencePos(contig, strandNum, x.anchor2);
     FinalSimilarity s = {x.probRatio, profileNum, strandNum,
-			 x.anchor1, anchor2, x.anchor1, anchor2};
+			 x.anchor1, x.anchor2, x.anchor1, x.anchor2};
     if (!x.alignment.empty()) {
       s.start1 = x.alignment[0].start1;
-      s.start2 = contigToSequencePos(contig, strandNum, x.alignment[0].start2);
-      addAlignedProfile(s.alignedSequences, x.alignment, alphabet, profile);
-      addAlignedSequence(s.alignedSequences, x.alignment, alphabet, sequence);
+      s.start2 = x.alignment[0].start2;
+      addAlignedProfile(s.alignedSequences, x.alignment, alphabet, profileSeq);
+      addAlignedSequence(s.alignedSequences, x.alignment, alphabet,
+			 sequence, maskedSequence);
+      addAlignedProbs(s.alignedSequences, x.alignment, x.matchProbs.data());
     }
     similarities.push_back(s);
   }
+
+  return true;
 }
 
 double methodOfMomentsLambda(const double *scores, int n, double meanScore) {
@@ -924,11 +971,11 @@ void estimateGumbel(double &mmLambda, double &mmK, double &mmKsimple,
   methodOfLmomentsGumbel(lmLambda, lmK, scores, n, seqLength);
 }
 
-Triple estimateK(Profile profile, const Float *letterFreqs,
-		 char *sequence, int sequenceLength, int border,
-		 int numOfSequences, Float *scratch, int printVerbosity) {
+void estimateK(Profile &profile, const Float *letterFreqs,
+	       char *sequence, int sequenceLength, int border,
+	       int numOfSequences, Float *scratch, int printVerbosity) {
   std::mt19937_64 randGen;
-  int alphabetSize = profile.width - 6;
+  int alphabetSize = profile.width - nonLetterWidth;
   std::discrete_distribution<> dist(letterFreqs, letterFreqs + alphabetSize);
 
   std::vector<double> scores(numOfSequences * 3);
@@ -947,8 +994,9 @@ Triple estimateK(Profile profile, const Float *letterFreqs,
     for (int j = 0; j <= sequenceLength; ++j) sequence[j] = dist(randGen);
     for (int j = 0; j < border; ++j) sequence[sequenceLength+j] = sequence[j];
     std::vector<AlignedSimilarity> sims;
-    findSimilarities(sims, profile, sequence, sequenceLength + border,
-		     scratch, -2);
+    bool isOk = findSimilarities(sims, profile, sequence,
+				 sequenceLength + border, scratch, -2);
+    assert(isOk);
     endScores[i] = log(sims[0].probRatio);
     begScores[i] = log(sims[1].probRatio);
     midScores[i] = log(sims[2].probRatio);
@@ -1016,8 +1064,9 @@ Triple estimateK(Profile profile, const Float *letterFreqs,
     std::cout << "# K: " << MMmidKsimple/scale << "\n";
   }
 
-  Triple h = {MMendKsimple, MMbegKsimple, MMmidKsimple};
-  return h;
+  profile.gumbelKendAnchored = MMendKsimple;
+  profile.gumbelKbegAnchored = MMbegKsimple;
+  profile.gumbelKmidAnchored = MMmidKsimple;
 }
 
 int intFromText(const char *text) {
@@ -1032,35 +1081,110 @@ double probFromText(const char *text) {
   return exp(-d);
 }
 
-double geometricMean(const Float *values, int length, int step) {
-  double mean = 0;
-  for (int i = 0; i < length; ++i) {
-    double v = values[i * step];
-    if (v <= 0) std::cerr << "zero probability at position " << i << "\n";
-    if (v <= 0) return 0;
-    mean += log(v);
-  }
-  return exp(mean / length);
+void normalize(Float *x, int n) {
+  double sum = 0;
+  for (int i = 0; i < n; ++i) sum += x[i];
+  assert(sum > 0);
+  for (int i = 0; i < n; ++i) x[i] /= sum;
 }
 
-int finalizeProfile(Profile p) {
+double meanOfLogs(const Float *x, int n) {
+  double m = 1;
+  for (int i = 0; i < n; ++i) m *= x[i];
+  return log(m) / n;
+}
+
+double myMean(const Float *values, int length, int step, int meanType,
+	      Float *valuesForMedian, const float *tantanProbs) {
+  double mean = 0;
+  int n = 0;
+  for (int i = 0; i < length; ++i) {
+    if (tantanProbs[i] >= 0.5) continue;
+    double v = values[i * step];
+    // Geometric mean is bad for zero (or very low) probabilities
+    // All letter probs in Dfam-curated_only 3.9 and Pfam-A 38.0 are > 1e-6
+    if (meanType == 'G') mean += log(std::max(v, 1e-6));  // geometric mean
+    if (meanType == 'A') mean += v;                       // arithmetic mean
+    if (meanType == 'M') valuesForMedian[n] = v;          // median
+    ++n;
+  }
+  assert(n > 0);
+  if (meanType == 'G') return exp(mean / n);
+  if (meanType == 'A') return mean / n;
+  std::sort(valuesForMedian, valuesForMedian + n);
+  return valuesForMedian[n / 2];
+}
+
+void filterLetterProbabilities(Float *letterProbs, int length, int step,
+			       double stdDev, bool keepNonvaryingTerm) {
+  const double sqrt2pi = 2.5066282746310005;
+  const double inv2var = 0.5 / (stdDev * stdDev);
+  const int gaussianLimit = ceil(stdDev * 8);  // truncate Gaussian tails
+  const int alphabetSize = step - nonLetterWidth;
+  std::vector<double> meanLogProbs(length);
+  std::vector<double> values(length);
+
+  for (int i = 0; i < length; ++i) {
+    meanLogProbs[i] = meanOfLogs(letterProbs + i * step, alphabetSize);
+  }  // at each position in the profile, calculate: mean(log(letter prob))
+
+  for (int k = 0; k < alphabetSize; ++k) {
+    for (int i = 0; i < length; ++i) {
+      double prob = letterProbs[i * step + k];
+      values[i] = log(prob) - meanLogProbs[i];  // apply filter to this
+    }
+
+    double addItBack = keepNonvaryingTerm ? mean(values.data(), length) : 0.0;
+    for (int i = 0; i < length; ++i) {
+      double sum = 0;
+      for (int j = -gaussianLimit; j <= gaussianLimit; ++j) {
+	// xxx this treats the profile as circular (wrapping around at
+	// the edges), which is rarely appropriate, but ensures no
+	// change in average value:
+	int x = (i + j) % length;
+	if (x < 0) x += length;
+	sum += values[x] * exp(-1.0 * j * j * inv2var);
+      }
+      sum /= stdDev * sqrt2pi;
+      letterProbs[i * step + k] = exp(values[i] - sum + addItBack);
+    }
+  }
+
+  for (int i = 0; i < length; ++i) {
+    normalize(letterProbs + i * step, alphabetSize);
+  }
+}
+
+int finalizeProfile(Profile p, char *consensusSequence,
+		    int backgroundProbsType, bool isMask,
+		    double filterStdDev, bool keepNonvaryingTerm) {
+  int alphabetSize = p.width - nonLetterWidth;
+  std::vector<float> tantanProbs(p.length);
+  std::vector<Float> valuesForMedian(p.length);
   Float *end = p.values + p.width * p.length;
 
   if (end[3] <= 0) {
     // set the final epsilon to the geometric mean of the other epsilons
-    end[3] = geometricMean(p.values + p.width + 3, p.length - 1, p.width);
+    end[3] = myMean(p.values + p.width + 3, p.length - 1, p.width, 'G',
+		    valuesForMedian.data(), tantanProbs.data());
   }
 
-  // set the background letter probabilities proportional to the
-  // geometric mean of the foreground letter probabilities
-  double sum = 0;
-  for (int k = 4; k < p.width - 2; ++k) {
-    double m = geometricMean(p.values + k, p.length, p.width);
-    if (m <= 0) return 0;
-    end[k] = m;
-    sum += m;
+  if (filterStdDev > 0) {
+    filterLetterProbabilities(p.values + 4, p.length, p.width,
+			      filterStdDev, keepNonvaryingTerm);
+  } else if (isMask && (alphabetSize == 4 || alphabetSize == 20)) {
+    calcTantanProbabilities((const unsigned char *)consensusSequence, p.length,
+			    alphabetSize > 4, tantanProbs.data());
   }
-  for (int k = 4; k < p.width - 2; ++k) end[k] /= sum;
+
+  double sumOfMeans = 0;
+  for (int k = 4; k < 4 + alphabetSize; ++k) {
+    double mean = myMean(p.values + k, p.length, p.width, backgroundProbsType,
+			 valuesForMedian.data(), tantanProbs.data());
+    end[k] = mean;
+    sumOfMeans += mean;
+  }
+  for (int k = 4; k < 4 + alphabetSize; ++k) end[k] /= sumOfMeans;
 
   for (int i = 0; ; ++i) {
     Float *probs = p.values + i * p.width;
@@ -1077,20 +1201,30 @@ int finalizeProfile(Profile p) {
     if (epsilon >= 1) return 0;
     probs[2] = delta * (1 - epsilon1);
     probs[3] = epsilon * (1 - epsilon1) / (1 - epsilon);
-    for (int k = 4; k < p.width - 2; ++k) {
-      probs[k] = c * probs[k] / end[k];
+    Float minVal = c;
+    for (int k = 4; k < 4 + alphabetSize; ++k) {
+      if (tantanProbs[i] >= 0.5) probs[k] = end[k];
+      double p = probs[k];
+      probs[k] = c * (p / end[k]);
+      minVal = std::min(minVal, probs[k]);
     }
-    if (p.width == 26) {
+    if (alphabetSize == 20) {
       probs[4 + 20] = probs[4 + 1];  // selenocysteine = cysteine
       probs[4 + 21] = probs[4 + 8];  // pyrrolysine = lysine
     }
+    probs[4 + alphabetSize + 2] = minVal;  // for unknown sequence letters
+    probs[4 + alphabetSize + 3] = minVal;  // for masked sequence letters
+    if (alphabetSize == 4) probs[4 + 5] = probs[4 + 6];  // rev-comp of unknown
+    if (tantanProbs[i] >= 0.5) consensusSequence[i] |= 32;
   }
 
   return 1;
 }
 
 int readProfiles(std::istream &in, std::vector<Profile> &profiles,
-		 std::vector<Float> &values, std::vector<char> &names) {
+		 std::vector<Float> &values, std::vector<char> &charVec,
+		 int backgroundProbsType, bool isMask,
+		 double filterStdDev, bool keepNonvaryingTerm) {
   Profile profile = {0};
   int state = 0;
   std::string line, word;
@@ -1100,10 +1234,11 @@ int readProfiles(std::istream &in, std::vector<Profile> &profiles,
     switch (state) {
     case 0:
       if (word == "NAME") {
-	profile.nameIdx = names.size();
+	profile.nameIdx = charVec.size();
 	iss >> word;
 	const char *name = word.c_str();
-	names.insert(names.end(), name, name + word.size() + 1);
+	charVec.insert(charVec.end(), name, name + word.size() + 1);
+	profile.consensusSequenceIdx = charVec.size();
       } else if (word == "HMM") {
 	++state;
       }
@@ -1141,28 +1276,33 @@ int readProfiles(std::istream &in, std::vector<Profile> &profiles,
 	profile.width = profile.length = 0;
 	state = 0;
       } else {
-	int k = 6;
+	int k = 0;
 	while (iss >> word && strchr(word.c_str(), '.')) {  // xxx "*"?
 	  double prob = probFromText(word.c_str());
 	  if (prob > 1) return 0;
 	  values.push_back(prob);
 	  ++k;
 	}
-	values.insert(values.end(), 2, 0.0);  // allow for 2 unusual letters
-	if (k == 6) return 0;
-	if (profile.width > 0 && k != profile.width) return 0;
-	profile.width = k;
+	values.insert(values.end(), nonLetterWidth - 4, 0.0);  // extra letters
+	if (k == 0) return 0;
+	if (profile.width > 0 && k + nonLetterWidth != profile.width) return 0;
+	profile.width = k + nonLetterWidth;
 	profile.length += 1;
 	if (profile.length + 1 > INT_MAX / profile.width) return 0;
+	const Float *letterProbs = &values[values.size() - profile.width + 4];
+	const Float *m = std::max_element(letterProbs, letterProbs + k);
+	charVec.push_back(m - letterProbs);  // consensus sequence
 	state = 2;
       }
     }
   }
 
-  Float *v = &values[0];
+  Float *v = values.data();
   for (auto &p : profiles) {
     p.values = v;
-    if (!finalizeProfile(p)) return 0;
+    char *consensus = &charVec[p.consensusSequenceIdx];
+    if (!finalizeProfile(p, consensus, backgroundProbsType, isMask,
+			 filterStdDev, keepNonvaryingTerm)) return 0;
     v += p.width * (p.length + 1);
   }
 
@@ -1189,16 +1329,32 @@ Float *resizeMem(Float *v, size_t &size,
     free(v);
     v = (Float *)aligned_alloc(simdLen * sizeof(Float), s * sizeof(Float));
     // this memory allocation doesn't get "free"-d at the end: that is ok!
+    if (!v) std::cerr << "failed to allocate memory for " << s << " numbers\n";
   }
   return v;
+}
+
+void makeMaskedSequence(char *sequence, int length, int alphabetSize) {
+  char *maskedSequence = sequence + length;
+  std::vector<float> tantanProbs(length);
+  calcTantanProbabilities((const unsigned char *)sequence, length,
+			  alphabetSize > 4, tantanProbs.data());
+  int mask = alphabetSize + 3;
+  for (int i = 0; i < length; ++i) {
+    maskedSequence[i] = (tantanProbs[i] < 0.5) ? sequence[i] : mask;
+  }
 }
 
 int main(int argc, char* argv[]) {
   double evalueOpt = OPT_e;
   int strandOpt = OPT_s;
+  int maskOpt = OPT_m;
+  double filterStdDev = 0;
+  bool keepNonvaryingTerm = false;
   int randomSeqNum = OPT_t;
   int randomSeqLen = OPT_l;
   int border = OPT_b;
+  int backgroundProbsType = 'G';
 
   const char help[] = "\
 usage: dummer profiles.hmm [sequences.fa]\n\
@@ -1210,12 +1366,17 @@ Options:\n\
   -h, --help        show this help message and exit\n\
   -V, --version     show version and exit\n\
   -v, --verbose     show progress messages\n\
-\n\
-Options for real sequences:\n\
   -e E, --evalue E  find similarities with E-value <= this (default: "
     STR(OPT_e) ")\n\
   -s S, --strand S  DNA strand: 0=reverse, 1=forward, 2=both (default: "
     STR(OPT_s) ")\n\
+  -m M, --mask M    mask simple regions of:\n\
+                    0=neither, 1=profile, 2=sequence, 3=both (default: "
+    STR(OPT_m) ")\n\
+\n\
+Options for low-cut/high-pass filter on position-specific letter probabilities:\n\
+  -d D, --dev D     standard deviation for Gaussian filter\n\
+  -D D, --Dev D     same as above, but keep the non-varying component\n\
 \n\
 Options for random sequences:\n\
   -t T, --trials T  generate this many random sequences (default: "
@@ -1224,9 +1385,14 @@ Options for random sequences:\n\
     STR(OPT_l) ")\n\
   -b B, --border B  add this size border to each random sequence (default: "
     STR(OPT_b) ")\n\
+\n\
+Options for background letter probabilities:\n\
+  --barithmetic     arithmetic mean of position-specific probabilities\n\
+  --bgeometric      geometric mean of position-specific probabilities (default)\n\
+  --bmedian         median of position-specific probabilities\n\
 ";
 
-  const char sOpts[] = "hVve:s:t:l:b:";
+  const char sOpts[] = "hVve:s:m:d:D:t:l:b:";
 
   static struct option lOpts[] = {
     {"help",    no_argument,       0, 'h'},
@@ -1234,9 +1400,15 @@ Options for random sequences:\n\
     {"verbose", no_argument,       0, 'v'},
     {"evalue",  required_argument, 0, 'e'},
     {"strand",  required_argument, 0, 's'},
+    {"mask",    required_argument, 0, 'm'},
+    {"dev",     required_argument, 0, 'd'},
+    {"Dev",     required_argument, 0, 'D'},
     {"trials",  required_argument, 0, 't'},
     {"length",  required_argument, 0, 'l'},
     {"border",  required_argument, 0, 'b'},
+    {"barithmetic", no_argument,   0, 'A'},
+    {"bgeometric",  no_argument,   0, 'G'},
+    {"bmedian",     no_argument,   0, 'M'},
     {0, 0, 0, 0}
   };
 
@@ -1262,6 +1434,20 @@ Options for random sequences:\n\
       strandOpt = intFromText(optarg);
       if (strandOpt < 0 || strandOpt > 2) return badOpt();
       break;
+    case 'm':
+      maskOpt = intFromText(optarg);
+      if (maskOpt < 0 || maskOpt > 3) return badOpt();
+      break;
+    case 'd':
+      filterStdDev = strtod(optarg, 0);
+      // too low: discretized Gaussian problems; too high: overflow or slow
+      if (filterStdDev < 2 || filterStdDev > 1000) return badOpt();
+      break;
+    case 'D':
+      filterStdDev = strtod(optarg, 0);
+      if (filterStdDev < 2 || filterStdDev > 1000) return badOpt();
+      keepNonvaryingTerm = true;
+      break;
     case 't':
       randomSeqNum = intFromText(optarg);
       if (randomSeqNum < 1) return badOpt();
@@ -1275,11 +1461,22 @@ Options for random sequences:\n\
       border = intFromText(optarg);
       if (border < 0) return badOpt();
       break;
+    case 'A':
+      backgroundProbsType = 'A';
+      break;
+    case 'G':
+      backgroundProbsType = 'G';
+      break;
+    case 'M':
+      backgroundProbsType = 'M';
+      break;
     case '?':
       std::cerr << help;
       return 1;
     }
   }
+
+  if (filterStdDev > 0) maskOpt &= 2;  // filtering turns off profile-masking
 
   if (argc - optind < 1 || argc - optind > 2) {
     std::cerr << help;
@@ -1287,8 +1484,7 @@ Options for random sequences:\n\
   }
 
   if (border > INT_MAX - 2 * simdLen - randomSeqLen) {
-    std::cerr << "sequence + border is too big\n";
-    return 1;
+    return err("sequence + border is too big");
   }
 
   std::vector<char> charVec;
@@ -1299,9 +1495,10 @@ Options for random sequences:\n\
     std::ifstream file;
     std::istream &in = openFile(file, argv[optind]);
     if (!file) return 1;
-    if (!readProfiles(in, profiles, profileValues, charVec)) {
-      std::cerr << "can't read the profile data\n";
-      return 1;
+    if (!readProfiles(in, profiles, profileValues, charVec,
+		      backgroundProbsType, maskOpt & 1,
+		      filterStdDev, keepNonvaryingTerm)) {
+      return err("can't read the profile data");
     }
   }
 
@@ -1324,9 +1521,18 @@ Options for random sequences:\n\
 #include "version.hh"
     "\n";
   std::cout << "# Bytes per floating-point number: " << sizeof(Float) << "\n";
+  if (filterStdDev > 0)
+    std::cout << "# Filtering position-specific letter probabilities: std dev "
+	      << filterStdDev << "\n";
+  std::cout << "# Background letter probabilities: "
+	    << (backgroundProbsType == 'A' ? "arithmetic mean" :
+		backgroundProbsType == 'G' ? "geometric mean" : "median")
+	    << " of foreground probabilities\n";
   std::cout << "# Random sequences: trials=" << randomSeqNum
 	    << " length=" << randomSeqLen << " border=" << border << "\n";
+  if (maskOpt & 1) std::cout << "# Masking simple regions in profiles\n";
   if (argc - optind > 1) {
+    if (maskOpt & 2) std::cout << "# Masking simple regions in sequences\n";
     if (evalueOpt > 0) std::cout << "# E-value <= " << evalueOpt << "\n";
     if (strandOpt < 2)
       std::cout << "# Strand: " << (strandOpt ? "forward" : "reverse") << "\n";
@@ -1334,23 +1540,23 @@ Options for random sequences:\n\
 
   int printVerbosity = (argc - optind < 2) * 2 + (evalueOpt <= 0);
 
-  double totEndK = 0;
-  double totBegK = 0;
-  double totMidK = 0;
-
-  for (auto p : profiles) {
-    const Float *profileEnd = p.values + p.width * p.length;
+  for (auto &p : profiles) {
     std::cout << "\n";
     std::cout << "# Profile name: " << &charVec[p.nameIdx] << "\n";
     std::cout << "# Profile length: " << p.length << "\n";
+    if (maskOpt & 1) {
+      int maskCount = 0;
+      const char *consensus = &charVec[p.consensusSequenceIdx];
+      for (int i = 0; i < p.length; ++i) maskCount += (consensus[i] > 31);
+      std::cout << "# Positions masked by tantan: " << maskCount << "\n";
+    }
+    const Float *bgProbs = p.values + p.width * p.length + 4;
     std::cout << "# Background letter probabilities:";
-    for (int j = 4; j < p.width - 2; ++j) std::cout << " " << profileEnd[j];
+    for (int j = 0; j < p.width - nonLetterWidth; ++j)
+      std::cout << " " << bgProbs[j];
     std::cout << std::endl;
-    Triple r = estimateK(p, profileEnd+4, &charVec[seqIdx], randomSeqLen,
-			 border, randomSeqNum, scratch, printVerbosity);
-    totEndK += r.endAnchored;
-    totBegK += r.begAnchored;
-    totMidK += r.midAnchored;
+    estimateK(p, bgProbs, &charVec[seqIdx], randomSeqLen,
+	      border, randomSeqNum, scratch, printVerbosity);
   }
 
   if (argc - optind < 2 || numOfProfiles < 1) return 0;
@@ -1360,20 +1566,16 @@ Options for random sequences:\n\
   for (size_t i = 1; i < numOfProfiles; ++i) {
     if (profiles[i].width != width) width = 0;
   }
-  char charToNumber[256];
-  memset(charToNumber, 127, 256);
-  if (width == 10) {
-    setCharToNumber(charToNumber, "ACGT");
-    setCharToNumber(charToNumber, "ACGU");
-  } else if (width == 26) {
-    setCharToNumber(charToNumber, "ACDEFGHIKLMNPQRSTVWYUO");
-    strandOpt = 1;
-  } else {
-    std::cerr << "the profiles should be all protein, or all nucleotide\n";
-    return 1;
+  int alphabetSize = width - nonLetterWidth;
+  const char *alphabet = getAlphabet(alphabetSize);
+  if (!alphabet) {
+    return err("the profiles should be all protein, or all nucleotide");
   }
-  memset(charToNumber, 125, ' '+1);  // map "space characters" (<= ' ') to 125
-  charToNumber['>'] = 126;
+  char charToNumber[256];
+  memset(charToNumber, alphabetSize + 2, 256);
+  setCharToNumber(charToNumber, alphabet);
+  if (alphabetSize == 4) setCharToNumber(charToNumber, "ACGU");  // set U = T
+  if (alphabetSize != 4) strandOpt = 1;
 
   charVec.resize(seqIdx);
   std::vector<Sequence> sequences;
@@ -1384,34 +1586,42 @@ Options for random sequences:\n\
   std::istream &in = openFile(file, argv[optind + 1]);
   if (!file) return 1;
   Sequence sequence;
-  Contig contig = {0, 0};
-  while (readContig(in, sequence, contig, charVec, charToNumber)) {
-    if (contig.length == 0) {
-      sequences.push_back(sequence);
-      continue;
-    }
-    seqIdx = charVec.size() - contig.length;
+  while (readSequence(in, sequence, charVec, charToNumber)) {
+    seqIdx = charVec.size() - sequence.length;
+    size_t maskedSeqIdx = (maskOpt & 2) ? charVec.size() : seqIdx;
     // The algorithms need one arbitrary letter past the end
     // Then round up to a multiple of the SIMD length
-    charVec.resize(seqIdx + simdRoundUp(contig.length + 1));
-    scratch = resizeMem(scratch, scratchSize, maxProfileLength, contig.length);
+    charVec.resize(maskedSeqIdx + simdRoundUp(sequence.length + 1));
+    int maxWinLen = sequenceWindowLength(maxProfileLength);
+    scratch = resizeMem(scratch, scratchSize, maxProfileLength,
+			std::min(sequence.length, maxWinLen));
     if (!scratch) return 1;
-    totSequenceLength += contig.length;
-    if (strandOpt == 2) totSequenceLength += contig.length;
-    Float minProbRatio =
-      (evalueOpt > 0) ? totMidK * totSequenceLength / evalueOpt * scale : -1;
+    totSequenceLength += sequence.length;
+    if (strandOpt == 2) totSequenceLength += sequence.length;
+    char *seq = &charVec[seqIdx];
     for (int s = 0; s < 2; ++s) {
       if (s != strandOpt) {
+	if (maskOpt & 2) makeMaskedSequence(seq, sequence.length, alphabetSize);
 	size_t strandNum = sequences.size() * 2 + s;
 	for (size_t j = 0; j < numOfProfiles; ++j) {
+	  Profile p = profiles[j];
+	  Float minProbRatio = (evalueOpt > 0) ?
+	    p.gumbelKmidAnchored * totSequenceLength / evalueOpt * scale : -1;
 	  if (verbosity > 1)
-	    std::cerr << "Profile: " << &charVec[profiles[j].nameIdx] << "\n";
-	  findFinalSimilarities(similarities, profiles[j], &charVec[seqIdx],
-				contig, scratch, j, strandNum, minProbRatio);
+	    std::cerr << "Profile: " << &charVec[p.nameIdx] << "\n";
+	  if (!findFinalSimilarities(similarities, p, charVec.data(),
+				     seqIdx, maskedSeqIdx, sequence.length,
+				     scratch, j, strandNum, minProbRatio)) {
+	    std::cout << "# Too strong similarity: "
+		      << &charVec[p.nameIdx] << " "
+		      << &charVec[sequence.nameIdx] << " "
+		      << "+-"[s] << " score=inf E=0" << std::endl;
+	  }
 	}
       }
-      reverseComplement(&charVec[seqIdx], &charVec[seqIdx] + contig.length);
+      reverseComplement(seq, seq + sequence.length);
     }
+    sequences.push_back(sequence);
     charVec.resize(seqIdx);
   }
 
@@ -1421,8 +1631,9 @@ Options for random sequences:\n\
   for (size_t i = 0; i < similarities.size(); ++i) {
     Profile p = profiles[similarities[i].profileNum];
     Sequence s = sequences[similarities[i].strandNum / 2];
-    double k = (evalueOpt > 0) ? totMidK :
-      (i % 3 == 0) ? totEndK : (i % 3 == 1) ? totBegK : totMidK;
+    double k = (evalueOpt > 0) ? p.gumbelKmidAnchored :
+      (i % 3 == 0) ? p.gumbelKendAnchored :
+      (i % 3 == 1) ? p.gumbelKbegAnchored : p.gumbelKmidAnchored;
     double evalue = k * totSequenceLength / similarities[i].probRatio;
     if (evalueOpt <= 0 && i % 3 == 0) std::cout << "\n";
     if (evalueOpt > 0 && evalue > evalueOpt) continue;
